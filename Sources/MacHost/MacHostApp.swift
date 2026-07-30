@@ -258,7 +258,6 @@ public final class MacHostSession: @unchecked Sendable {
         timer.schedule(deadline: .now() + 2.0, repeating: 2.0)
         timer.setEventHandler { [weak self] in
             self?.videoPipeline?.forceKeyframe()
-            logPrint("🔄 MacHost Failsafe: Triggered 2.0s recurring IDR Keyframe generation")
         }
         timer.resume()
         self.keyframeTimer = timer
