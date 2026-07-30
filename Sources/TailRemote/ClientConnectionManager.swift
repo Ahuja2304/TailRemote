@@ -6,7 +6,7 @@ import os.log
 
 private let logger = OSLog(subsystem: "com.tailremote", category: "JitterBuffer")
 
-// MARK: - Phase 2: Aggressive 33ms TTL Out-of-Order UDP Jitter Buffer
+// MARK: - Phase 2: Relaxed 150ms TTL Out-of-Order UDP Jitter Buffer with 3-State Telemetry
 
 public final class UDPFrameJitterBuffer: @unchecked Sendable {
     private struct FrameAssemblySlot {
@@ -18,7 +18,7 @@ public final class UDPFrameJitterBuffer: @unchecked Sendable {
     private var buffer: [UInt32: FrameAssemblySlot] = [:]
     private var latestCompletedFrameID: UInt32 = 0
     private let lock = NSLock()
-    private let ttlSeconds: TimeInterval = 0.033 // Strict 33ms Time-To-Live threshold
+    private let ttlSeconds: TimeInterval = 0.150 // Relaxed 150ms Time-To-Live threshold for Wi-Fi latency
     
     public init() {}
     
@@ -28,16 +28,19 @@ public final class UDPFrameJitterBuffer: @unchecked Sendable {
         
         let frameID = header.frameID
         
-        // 1. Instant Stale Purge: If fragment is from an older frame than already decoded, drop immediately
+        // 1. Check if fragment is from an older frame than already completed
         if frameID <= latestCompletedFrameID {
+            os_log("🟡 Frame %u DROPPED: Superseded by newer Frame %u", log: logger, type: .default, frameID, latestCompletedFrameID)
             return nil
         }
         
-        // 2. Aggressive Frame Purge: Purge all older incomplete frames (< frameID) to prioritize freshest frame
+        // 2. Purge older incomplete frame slots (< frameID)
         purgeOlderSlots(than: frameID)
         
-        // 3. TTL Check: Purge any expired slot older than 33ms
+        // 3. TTL Check: Check if existing frame slot has expired (> 150ms)
         if let existingSlot = buffer[frameID], Date().timeIntervalSince(existingSlot.timestamp) > ttlSeconds {
+            let missingFrags = Int(existingSlot.totalFragments) - existingSlot.fragments.count
+            os_log("🔴 Frame %u DROPPED: TTL Expired (Missing %d fragments)", log: logger, type: .error, frameID, missingFrags)
             buffer.removeValue(forKey: frameID)
             return nil
         }
@@ -53,6 +56,8 @@ public final class UDPFrameJitterBuffer: @unchecked Sendable {
                 if let fragData = slot.fragments[fragIndex] {
                     reassembledFrame.append(fragData)
                 } else {
+                    let missing = Int(header.totalFragments) - slot.fragments.count
+                    os_log("🔴 Frame %u DROPPED: Missing %d fragments", log: logger, type: .error, frameID, missing)
                     return nil
                 }
             }
@@ -60,9 +65,7 @@ public final class UDPFrameJitterBuffer: @unchecked Sendable {
             latestCompletedFrameID = frameID
             buffer.removeValue(forKey: frameID)
             
-            let timestamp = CACurrentMediaTime()
-            os_log("UDP Frame %u fully reassembled and passed to decoder at %.6f", log: logger, type: .info, frameID, timestamp)
-            
+            os_log("🟢 Frame %u fully assembled (%d bytes) -> Sent to Decoder", log: logger, type: .info, frameID, reassembledFrame.count)
             return reassembledFrame
         }
         
@@ -71,7 +74,18 @@ public final class UDPFrameJitterBuffer: @unchecked Sendable {
     
     private func purgeOlderSlots(than currentFrameID: UInt32) {
         let now = Date()
-        let keysToRemove = buffer.keys.filter { $0 < currentFrameID || now.timeIntervalSince(buffer[$0]?.timestamp ?? now) > ttlSeconds }
+        let keysToRemove = buffer.keys.filter { key in
+            if key < currentFrameID {
+                os_log("🟡 Frame %u DROPPED: Superseded by newer Frame %u", log: logger, type: .default, key, currentFrameID)
+                return true
+            }
+            if let slot = buffer[key], now.timeIntervalSince(slot.timestamp) > ttlSeconds {
+                let missingFrags = Int(slot.totalFragments) - slot.fragments.count
+                os_log("🔴 Frame %u DROPPED: TTL Expired (Missing %d fragments)", log: logger, type: .error, key, missingFrags)
+                return true
+            }
+            return false
+        }
         for key in keysToRemove {
             buffer.removeValue(forKey: key)
         }
@@ -133,10 +147,12 @@ public final class ClientConnectionManager: ObservableObject {
                 switch state {
                 case .ready:
                     print("✅ iPhone: Connected TCP Control Channel (\(targetHost):\(port)).")
+                    os_log("✅ TCP Socket READY (%{public}@:%u)", log: logger, type: .info, targetHost, port)
                     self?.isConnected = true
                     self?.receiveNextTCP()
                 case .failed(let error):
                     print("❌ iPhone: TCP Connection failed: \(error)")
+                    os_log("❌ TCP Socket FAILED: %{public}@", log: logger, type: .error, error.localizedDescription)
                     self?.isConnected = false
                     self?.isAuthenticated = false
                 case .cancelled:
@@ -150,16 +166,22 @@ public final class ClientConnectionManager: ObservableObject {
         
         nwTCPConnection.start(queue: .global(qos: .userInteractive))
         
-        // 2. UDP Video Connection
+        // 2. UDP Video Connection (Port 8089 Validation)
         let udpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetHost), port: NWEndpoint.Port(rawValue: udpPort)!)
         let nwUDPConnection = NWConnection(to: udpEndpoint, using: .udp)
         self.udpConnection = nwUDPConnection
         
         nwUDPConnection.stateUpdateHandler = { state in
-            if state == .ready {
+            switch state {
+            case .ready:
                 print("📡 iPhone: UDP Video Socket READY (\(targetHost):\(udpPort)). Sending registration handshake...")
+                os_log("📡 UDP Socket READY (%{public}@:%u)", log: logger, type: .info, targetHost, udpPort)
                 let hello = Data("HELO".utf8)
                 nwUDPConnection.send(content: hello, completion: .idempotent)
+            case .failed(let error):
+                os_log("❌ UDP Socket FAILED: %{public}@", log: logger, type: .error, error.localizedDescription)
+            default:
+                break
             }
         }
         

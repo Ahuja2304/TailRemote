@@ -2,8 +2,11 @@ import Foundation
 import AVFoundation
 import CoreMedia
 import VideoToolbox
+import os.log
 
-// MARK: - Zero-Copy H.264 Video Decoder for iOS Client
+private let logger = OSLog(subsystem: "com.tailremote", category: "VideoDecoder")
+
+// MARK: - Zero-Copy H.264 Video Decoder for iOS Client with Explicit OSLog Telemetry
 
 public final class iPhoneClientVideoDecoder: NSObject, @unchecked Sendable {
     private var formatDescription: CMFormatDescription?
@@ -24,8 +27,12 @@ public final class iPhoneClientVideoDecoder: NSObject, @unchecked Sendable {
             switch layer.status {
             case .rendering:
                 print("🟢 Decoder: AVSampleBufferDisplayLayer is actively RENDERING video")
+                os_log("🟢 Decoder: AVSampleBufferDisplayLayer is actively RENDERING video", log: logger, type: .info)
             case .failed:
-                print("❌ CRITICAL Decoder Error: AVSampleBufferDisplayLayer FAILED with error: \(String(describing: layer.error))")
+                let errorDesc = layer.error?.localizedDescription ?? "Unknown Error"
+                print("❌ CRITICAL Decoder Error: AVSampleBufferDisplayLayer FAILED with error: \(errorDesc)")
+                os_log("❌ Decoder Error: %{public}@", log: logger, type: .error, errorDesc)
+                
                 DispatchQueue.main.async {
                     layer.flush()
                     self?.formatDescription = nil
@@ -43,6 +50,7 @@ public final class iPhoneClientVideoDecoder: NSObject, @unchecked Sendable {
     public func handleFormatDescription(data: Data) {
         guard data.count >= 4 else {
             print("❌ Decoder: Received malformed formatDescription data (count < 4)")
+            os_log("❌ Decoder: Received malformed formatDescription data (count < 4)", log: logger, type: .error)
             return
         }
         
@@ -82,11 +90,13 @@ public final class iPhoneClientVideoDecoder: NSObject, @unchecked Sendable {
             if status == noErr {
                 self.formatDescription = newFormatDescription
                 print("🎥 Decoder: CMVideoFormatDescription created successfully (SPS: \(spsSize) bytes, PPS: \(ppsSize) bytes)")
+                os_log("🎥 Decoder: CMVideoFormatDescription created successfully (SPS: %d, PPS: %d)", log: logger, type: .info, spsSize, ppsSize)
                 DispatchQueue.main.async { [weak self] in
                     self?.displayLayer.flush()
                 }
             } else {
                 print("❌ CRITICAL: Failed to create Format Description. OSStatus: \(status)")
+                os_log("❌ CRITICAL: Failed to create Format Description. OSStatus: %d", log: logger, type: .error, status)
             }
         }
     }
@@ -98,6 +108,7 @@ public final class iPhoneClientVideoDecoder: NSObject, @unchecked Sendable {
             droppedFrameCount += 1
             if droppedFrameCount % 60 == 1 {
                 print("⚠️ Decoder dropping frame: Format Description (SPS/PPS) has not been received or parsed yet (Total dropped: \(droppedFrameCount))")
+                os_log("⚠️ Decoder dropping frame: Format Description (SPS/PPS) missing (Total dropped: %d)", log: logger, type: .default, droppedFrameCount)
             }
             return
         }
@@ -119,6 +130,7 @@ public final class iPhoneClientVideoDecoder: NSObject, @unchecked Sendable {
         
         if blockBufferStatus != kCMBlockBufferNoErr {
             print("❌ CRITICAL: Failed to create CMBlockBuffer. OSStatus: \(blockBufferStatus)")
+            os_log("❌ CRITICAL: Failed to create CMBlockBuffer. OSStatus: %d", log: logger, type: .error, blockBufferStatus)
             return
         }
         
@@ -153,6 +165,7 @@ public final class iPhoneClientVideoDecoder: NSObject, @unchecked Sendable {
         
         if sampleBufferStatus != noErr {
             print("❌ CRITICAL: Failed to create CMSampleBuffer. OSStatus: \(sampleBufferStatus)")
+            os_log("❌ CRITICAL: Failed to create CMSampleBuffer. OSStatus: %d", log: logger, type: .error, sampleBufferStatus)
             return
         }
         
@@ -167,7 +180,9 @@ public final class iPhoneClientVideoDecoder: NSObject, @unchecked Sendable {
         DispatchQueue.main.async { [weak self] in
             guard let self = self else { return }
             if self.displayLayer.status == .failed {
-                print("⚠️ Decoder: Flushing failed displayLayer: \(String(describing: self.displayLayer.error))")
+                let errStr = self.displayLayer.error?.localizedDescription ?? "Unknown"
+                print("⚠️ Decoder: Flushing failed displayLayer: \(errStr)")
+                os_log("❌ Decoder Error: %{public}@", log: logger, type: .error, errStr)
                 self.displayLayer.flush()
                 self.formatDescription = nil
                 self.onRequestIDRKeyframe?()

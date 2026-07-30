@@ -193,6 +193,7 @@ public final class MacHostSession: @unchecked Sendable {
     
     private var state: SessionAuthState = .waitingForAuth
     private var videoPipeline: MacHostVideoPipeline?
+    private var keyframeTimer: DispatchSourceTimer?
     private let fileBroker = FileBroker()
     
     public init(connection: NWConnection, expectedPIN: String, server: MacHostServer, clientIP: String) {
@@ -239,6 +240,8 @@ public final class MacHostSession: @unchecked Sendable {
         let pipeline = MacHostVideoPipeline(connection: udpConnection)
         self.videoPipeline = pipeline
         
+        startKeyframeFailsafeTimer()
+        
         Task {
             do {
                 try await pipeline.startCapture()
@@ -249,7 +252,25 @@ public final class MacHostSession: @unchecked Sendable {
         }
     }
     
+    private func startKeyframeFailsafeTimer() {
+        stopKeyframeFailsafeTimer()
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .userInteractive))
+        timer.schedule(deadline: .now() + 2.0, repeating: 2.0)
+        timer.setEventHandler { [weak self] in
+            self?.videoPipeline?.forceKeyframe()
+            logPrint("🔄 MacHost Failsafe: Triggered 2.0s recurring IDR Keyframe generation")
+        }
+        timer.resume()
+        self.keyframeTimer = timer
+    }
+    
+    private func stopKeyframeFailsafeTimer() {
+        keyframeTimer?.cancel()
+        keyframeTimer = nil
+    }
+    
     private func stopCapturePipeline() {
+        stopKeyframeFailsafeTimer()
         Task {
             await videoPipeline?.stopCapture()
             videoPipeline = nil
