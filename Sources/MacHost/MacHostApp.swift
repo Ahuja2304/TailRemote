@@ -96,6 +96,7 @@ public final class MacHostServer: @unchecked Sendable {
     private var listener: NWListener?
     private var udpListener: NWListener?
     private var activeSession: MacHostSession?
+    public var activeUDPConnection: NWConnection?
     
     public var blockedIPs = Set<String>()
     public var failedAttempts: [String: Int] = [:]
@@ -130,6 +131,7 @@ public final class MacHostServer: @unchecked Sendable {
         
         nwUDPListener.newConnectionHandler = { [weak self] connection in
             logPrint("📡 MacHost: Incoming UDP video connection from \(connection.endpoint)")
+            self?.activeUDPConnection = connection
             self?.activeSession?.assignUDPConnection(connection)
         }
         nwUDPListener.start(queue: .global(qos: .userInteractive))
@@ -310,6 +312,10 @@ public final class MacHostSession: @unchecked Sendable {
             logPrint("🔓 MacHost Gatekeeper: AUTHENTICATION SUCCESSFUL for client \(clientIP) with PIN '\(receivedPIN)'.")
             state = .authenticated
             server.failedAttempts[clientIP] = 0
+            
+            if self.udpConnection == nil, let globalUDP = server.activeUDPConnection {
+                assignUDPConnection(globalUDP)
+            }
             
             sendTLV(type: .authPIN, payload: Data([0x01]))
             startCapturePipeline()

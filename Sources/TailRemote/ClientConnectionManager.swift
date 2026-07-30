@@ -157,11 +157,15 @@ public final class ClientConnectionManager: ObservableObject {
         
         nwUDPConnection.stateUpdateHandler = { state in
             if state == .ready {
-                print("📡 iPhone: UDP Video Socket READY (\(targetHost):\(udpPort)).")
+                print("📡 iPhone: UDP Video Socket READY (\(targetHost):\(udpPort)). Sending registration handshake...")
+                let hello = Data("HELO".utf8)
+                nwUDPConnection.send(content: hello, completion: .idempotent)
             }
         }
         
         nwUDPConnection.start(queue: .global(qos: .userInteractive))
+        let initialHello = Data("HELO".utf8)
+        nwUDPConnection.send(content: initialHello, completion: .idempotent)
         receiveNextUDP()
     }
     

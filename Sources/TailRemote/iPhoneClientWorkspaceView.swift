@@ -70,53 +70,55 @@ public struct GatekeeperPinKeypadOverlayView: View {
             Color.black.opacity(0.85)
                 .ignoresSafeArea()
             
-            VStack(spacing: 20) {
-                // Header Icon & Title
-                VStack(spacing: 6) {
+            HStack(spacing: 28) {
+                // Left Column: Header Info & PIN Code Boxes
+                VStack(spacing: 12) {
                     Image(systemName: "lock.shield.fill")
-                        .font(.system(size: 40))
+                        .font(.system(size: 32))
                         .foregroundColor(.blue)
                     
                     Text("Gatekeeper Protection")
-                        .font(.title2)
+                        .font(.headline)
                         .fontWeight(.bold)
                         .foregroundColor(.white)
                     
                     Text("Enter 4-digit PIN displayed on MacHost")
-                        .font(.subheadline)
+                        .font(.caption)
                         .foregroundColor(.gray)
-                }
-                
-                // PIN Code Boxes
-                HStack(spacing: 16) {
-                    ForEach(0..<4, id: \.self) { index in
-                        ZStack {
-                            RoundedRectangle(cornerRadius: 12)
-                                .fill(Color.white.opacity(0.15))
-                                .frame(width: 50, height: 60)
-                                .overlay(
-                                    RoundedRectangle(cornerRadius: 12)
-                                        .stroke(index < enteredPIN.count ? Color.blue : Color.white.opacity(0.2), lineWidth: 2)
-                                )
-                            
-                            if index < enteredPIN.count {
-                                let charIndex = enteredPIN.index(enteredPIN.startIndex, offsetBy: index)
-                                Text(String(enteredPIN[charIndex]))
-                                    .font(.system(size: 28, weight: .bold, design: .monospaced))
-                                    .foregroundColor(.white)
+                        .multilineTextAlignment(.center)
+                    
+                    // PIN Code Boxes
+                    HStack(spacing: 10) {
+                        ForEach(0..<4, id: \.self) { index in
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 10)
+                                    .fill(Color.white.opacity(0.15))
+                                    .frame(width: 40, height: 48)
+                                    .overlay(
+                                        RoundedRectangle(cornerRadius: 10)
+                                            .stroke(index < enteredPIN.count ? Color.blue : Color.white.opacity(0.2), lineWidth: 2)
+                                    )
+                                
+                                if index < enteredPIN.count {
+                                    let charIndex = enteredPIN.index(enteredPIN.startIndex, offsetBy: index)
+                                    Text(String(enteredPIN[charIndex]))
+                                        .font(.system(size: 24, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.white)
+                                }
                             }
                         }
                     }
+                    
+                    if authFailed {
+                        Text("⚠️ Invalid PIN. Try again.")
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.red)
+                    }
                 }
+                .frame(width: 210)
                 
-                if authFailed {
-                    Text("⚠️ Invalid PIN. Try again (3 strikes = Block).")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundColor(.red)
-                }
-                
-                // Numeric Keypad Grid
+                // Right Column: Compact 3x4 Numeric Keypad Grid
                 let buttons: [[String]] = [
                     ["1", "2", "3"],
                     ["4", "5", "6"],
@@ -124,9 +126,9 @@ public struct GatekeeperPinKeypadOverlayView: View {
                     ["", "0", "⌫"]
                 ]
                 
-                VStack(spacing: 12) {
+                VStack(spacing: 8) {
                     ForEach(buttons, id: \.self) { row in
-                        HStack(spacing: 20) {
+                        HStack(spacing: 12) {
                             ForEach(row, id: \.self) { item in
                                 Button(action: {
                                     handleKeyPress(item)
@@ -134,10 +136,10 @@ public struct GatekeeperPinKeypadOverlayView: View {
                                     ZStack {
                                         Circle()
                                             .fill(item.isEmpty ? Color.clear : Color.white.opacity(0.2))
-                                            .frame(width: 55, height: 55)
+                                            .frame(width: 44, height: 44)
                                         
                                         Text(item)
-                                            .font(.system(size: 22, weight: .bold))
+                                            .font(.system(size: 18, weight: .bold))
                                             .foregroundColor(.white)
                                     }
                                 }
@@ -147,11 +149,11 @@ public struct GatekeeperPinKeypadOverlayView: View {
                     }
                 }
             }
-            .padding(24)
+            .padding(.horizontal, 24)
+            .padding(.vertical, 16)
             .background(.ultraThinMaterial)
             .cornerRadius(24)
             .shadow(radius: 20)
-            .frame(maxWidth: 380)
         }
     }
     
