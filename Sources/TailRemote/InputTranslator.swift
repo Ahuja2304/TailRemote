@@ -90,6 +90,7 @@ public class KeyInputView: UIView, UIKeyInput, UITextInputTraits {
 #if os(iOS)
 public struct TailRemoteGestureView: UIViewRepresentable {
     public var mode: ImmersiveWorkspaceState.InputMode
+    public var onLocalCursorMove: ((CGPoint) -> Void)?
     public var onRelativeMove: ((Float, Float) -> Void)?
     public var onAbsoluteMove: ((Float, Float) -> Void)?
     public var onMouseButton: ((MouseButtonType, MouseButtonState) -> Void)?
@@ -98,6 +99,7 @@ public struct TailRemoteGestureView: UIViewRepresentable {
     
     public init(
         mode: ImmersiveWorkspaceState.InputMode,
+        onLocalCursorMove: ((CGPoint) -> Void)? = nil,
         onRelativeMove: ((Float, Float) -> Void)? = nil,
         onAbsoluteMove: ((Float, Float) -> Void)? = nil,
         onMouseButton: ((MouseButtonType, MouseButtonState) -> Void)? = nil,
@@ -105,6 +107,7 @@ public struct TailRemoteGestureView: UIViewRepresentable {
         onUserInteraction: (() -> Void)? = nil
     ) {
         self.mode = mode
+        self.onLocalCursorMove = onLocalCursorMove
         self.onRelativeMove = onRelativeMove
         self.onAbsoluteMove = onAbsoluteMove
         self.onMouseButton = onMouseButton
@@ -115,6 +118,7 @@ public struct TailRemoteGestureView: UIViewRepresentable {
     public func makeUIView(context: Context) -> TrackpadUIView {
         let view = TrackpadUIView()
         view.mode = mode
+        view.onLocalCursorMove = onLocalCursorMove
         view.onRelativeMove = onRelativeMove
         view.onAbsoluteMove = onAbsoluteMove
         view.onMouseButton = onMouseButton
@@ -125,6 +129,7 @@ public struct TailRemoteGestureView: UIViewRepresentable {
 
     public func updateUIView(_ uiView: TrackpadUIView, context: Context) {
         uiView.mode = mode
+        uiView.onLocalCursorMove = onLocalCursorMove
         uiView.onRelativeMove = onRelativeMove
         uiView.onAbsoluteMove = onAbsoluteMove
         uiView.onMouseButton = onMouseButton
@@ -136,11 +141,14 @@ public struct TailRemoteGestureView: UIViewRepresentable {
 public class TrackpadUIView: UIView {
     public var mode: ImmersiveWorkspaceState.InputMode = .trackpadRelative
     
+    public var onLocalCursorMove: ((CGPoint) -> Void)?
     public var onRelativeMove: ((Float, Float) -> Void)?
     public var onAbsoluteMove: ((Float, Float) -> Void)?
     public var onMouseButton: ((MouseButtonType, MouseButtonState) -> Void)?
     public var onScroll: ((Float, Float) -> Void)?
     public var onUserInteraction: (() -> Void)?
+    
+    private var lastDispatchTime: Date = .distantPast
     
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -177,6 +185,17 @@ public class TrackpadUIView: UIView {
     
     @objc private func handleMovePan(_ sender: UIPanGestureRecognizer) {
         onUserInteraction?()
+        let location = sender.location(in: self)
+        
+        // 1. Immediate 120Hz Local Cursor Update (Zero Perceived Latency)
+        onLocalCursorMove?(location)
+        
+        // 2. 16.6ms Throttler Buffer (60Hz Network Rate Control)
+        let now = Date()
+        guard now.timeIntervalSince(lastDispatchTime) >= 0.0166667 || sender.state == .ended else {
+            return
+        }
+        lastDispatchTime = now
         
         if mode == .trackpadRelative {
             let translation = sender.translation(in: self)
@@ -185,7 +204,6 @@ public class TrackpadUIView: UIView {
                 sender.setTranslation(.zero, in: self)
             }
         } else if mode == .directTouchAbsolute {
-            let location = sender.location(in: self)
             let normX = max(0.0, min(1.0, Float(location.x / bounds.width)))
             let normY = max(0.0, min(1.0, Float(location.y / bounds.height)))
             onAbsoluteMove?(normX, normY)

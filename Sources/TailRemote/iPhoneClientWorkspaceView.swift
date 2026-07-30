@@ -224,6 +224,7 @@ public final class ImmersiveWorkspaceState {
 
 public struct iPhoneClientWorkspaceView: View {
     @State private var state = ImmersiveWorkspaceState()
+    @State private var localCursorPosition: CGPoint = CGPoint(x: 200, y: 200)
     
     public let displayLayer: AVSampleBufferDisplayLayer
     public var isAuthenticated: Bool = false
@@ -272,6 +273,14 @@ public struct iPhoneClientWorkspaceView: View {
             // Touch & Trackpad Gesture Interaction Layer
             TailRemoteGestureView(
                 mode: state.inputMode,
+                onLocalCursorMove: { point in
+                    if state.inputMode == .trackpadRelative {
+                        localCursorPosition.x += point.x
+                        localCursorPosition.y += point.y
+                    } else {
+                        localCursorPosition = point
+                    }
+                },
                 onRelativeMove: onRelativeMove,
                 onAbsoluteMove: onAbsoluteMove,
                 onMouseButton: onMouseButton,
@@ -282,6 +291,16 @@ public struct iPhoneClientWorkspaceView: View {
             )
             .ignoresSafeArea()
             .defersSystemGestures(on: .all)
+            
+            // Phase 2: Local Cursor Rendering Overlay (Zero Perceived Latency @ 120Hz)
+            if isAuthenticated {
+                Image(systemName: "cursorarrow")
+                    .font(.system(size: 20, weight: .bold))
+                    .foregroundColor(.white)
+                    .shadow(color: .black.opacity(0.8), radius: 3, x: 1, y: 2)
+                    .position(localCursorPosition)
+                    .allowsHitTesting(false)
+            }
             
             // Native UIKeyInput Keystroke Catcher
             RemoteKeyboardCatcher(isFirstResponder: $state.isKeyboardPresented) { keystroke in

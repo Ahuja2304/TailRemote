@@ -63,7 +63,7 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
             config.height = height
             config.minimumFrameInterval = CMTime(value: 1, timescale: 60) // 60 FPS target
             config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            config.showsCursor = true
+            config.showsCursor = false // Hide hardware host cursor to allow iOS Local Cursor Rendering
             config.queueDepth = 3 // Minimal queue depth to eliminate frame accumulation latency
             
             let stream = SCStream(filter: filter, configuration: config, delegate: nil)
