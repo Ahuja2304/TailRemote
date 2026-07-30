@@ -20,6 +20,7 @@
 		F1000010 /* FileBroker.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000010 /* FileBroker.swift */; };
 		F1000011 /* MacHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000011 /* MacHostApp.swift */; };
 		F1000012 /* InputTranslator.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000004 /* InputTranslator.swift */; };
+		F1000014 /* AdaptiveRateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000014 /* AdaptiveRateController.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -34,6 +35,7 @@
 		F2000009 /* SystemController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemController.swift; sourceTree = "<group>"; };
 		F2000010 /* FileBroker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBroker.swift; sourceTree = "<group>"; };
 		F2000011 /* MacHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacHostApp.swift; sourceTree = "<group>"; };
+		F2000014 /* AdaptiveRateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdaptiveRateController.swift; sourceTree = "<group>"; };
 		F3000001 /* TailRemoteiOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TailRemoteiOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F3000002 /* MacHost */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = MacHost; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -78,6 +80,7 @@
 				F2000001 /* TailRemoteProtocol.swift */,
 				F2000002 /* iPhoneClientVideoDecoder.swift */,
 				F2000003 /* iPhoneClientWorkspaceView.swift */,
+				F2000014 /* AdaptiveRateController.swift */,
 			);
 			path = Sources/TailRemote;
 			sourceTree = "<group>";
@@ -204,6 +207,7 @@
 				F1000010 /* FileBroker.swift in Sources */,
 				F1000011 /* MacHostApp.swift in Sources */,
 				F1000012 /* InputTranslator.swift in Sources */,
+				F1000014 /* AdaptiveRateController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

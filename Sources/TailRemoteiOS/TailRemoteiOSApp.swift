@@ -1,5 +1,4 @@
 import SwiftUI
-import TailRemote
 
 #if os(iOS)
 @main
