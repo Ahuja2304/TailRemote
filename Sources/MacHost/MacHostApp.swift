@@ -371,7 +371,7 @@ public final class MacHostSession: @unchecked Sendable {
         case 0x02:
             guard payload.count >= 9 else { return }
             let xRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self) }
-            let yRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self) }
+            let yRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: UInt32.self) }
             let normX = Float(bitPattern: UInt32(bigEndian: xRaw))
             let normY = Float(bitPattern: UInt32(bigEndian: yRaw))
             let mainBounds = CGDisplayBounds(CGMainDisplayID())

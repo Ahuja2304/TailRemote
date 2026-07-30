@@ -267,45 +267,47 @@ public struct iPhoneClientWorkspaceView: View {
     }
     
     public var body: some View {
-        ZStack {
-            // Base Layer: Native AVSampleBufferDisplayLayer spanning full landscape bounds
-            SampleBufferDisplayView(displayLayer: displayLayer)
-                .ignoresSafeArea()
-            
-            // Touch & Trackpad Gesture Interaction Layer
-            TailRemoteGestureView(
-                mode: state.inputMode,
-                onLocalCursorMove: { point in
-                    let screenSize = UIScreen.main.bounds.size
-                    if state.inputMode == .trackpadRelative {
-                        let newX = max(0, min(screenSize.width, localCursorPosition.x + point.x))
-                        let newY = max(0, min(screenSize.height, localCursorPosition.y + point.y))
-                        localCursorPosition = CGPoint(x: newX, y: newY)
-                    } else {
-                        localCursorPosition = point
+        GeometryReader { geo in
+            ZStack {
+                // Base Layer: Native AVSampleBufferDisplayLayer spanning full landscape bounds
+                SampleBufferDisplayView(displayLayer: displayLayer)
+                    .ignoresSafeArea()
+                
+                // Touch & Trackpad Gesture Interaction Layer
+                TailRemoteGestureView(
+                    mode: state.inputMode,
+                    onLocalCursorMove: { point in
+                        let screenSize = geo.size
+                        if state.inputMode == .trackpadRelative {
+                            let newX = max(0, min(screenSize.width, localCursorPosition.x + point.x))
+                            let newY = max(0, min(screenSize.height, localCursorPosition.y + point.y))
+                            localCursorPosition = CGPoint(x: newX, y: newY)
+                        } else {
+                            localCursorPosition = point
+                        }
+                    },
+                    onRelativeMove: onRelativeMove,
+                    onAbsoluteMove: onAbsoluteMove,
+                    onMouseButton: onMouseButton,
+                    onScroll: onScroll,
+                    onUserInteraction: {
+                        state.userInteracted()
                     }
-                },
-                onRelativeMove: onRelativeMove,
-                onAbsoluteMove: onAbsoluteMove,
-                onMouseButton: onMouseButton,
-                onScroll: onScroll,
-                onUserInteraction: {
-                    state.userInteracted()
+                )
+                .ignoresSafeArea()
+                .defersSystemGestures(on: .all)
+                
+                // Phase 1 & 2: Desktop-Scaled Local Cursor Rendering Overlay (Zero Perceived Latency @ 120Hz)
+                if isAuthenticated {
+                    Image(systemName: "cursorarrow")
+                        .font(.system(size: 14, weight: .medium))
+                        .foregroundColor(.white)
+                        .shadow(color: .black, radius: 2, x: 1, y: 1)
+                        .offset(x: -5, y: -5)
+                        .position(localCursorPosition)
+                        .allowsHitTesting(false)
+                        .zIndex(100)
                 }
-            )
-            .ignoresSafeArea()
-            .defersSystemGestures(on: .all)
-            
-            // Phase 2: Local Cursor Rendering Overlay (Zero Perceived Latency @ 120Hz)
-            if isAuthenticated {
-                Image(systemName: "cursorarrow")
-                    .font(.system(size: 24, weight: .bold))
-                    .foregroundColor(.white)
-                    .shadow(color: .black, radius: 2, x: 1, y: 1)
-                    .position(localCursorPosition)
-                    .allowsHitTesting(false)
-                    .zIndex(100)
-            }
             
             // Native UIKeyInput Keystroke Catcher
             RemoteKeyboardCatcher(isFirstResponder: $state.isKeyboardPresented) { keystroke in
@@ -394,5 +396,6 @@ public struct iPhoneClientWorkspaceView: View {
             }
         }
     }
+}
 }
 #endif
