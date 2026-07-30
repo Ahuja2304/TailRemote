@@ -55,15 +55,17 @@ public final class VideoFrameBufferPool: @unchecked Sendable {
     }
 }
 
-// MARK: - MacHost Video Pipeline Manager with UDP Datagram Fragmenter
+// MARK: - MacHost Video Pipeline Manager with Motion-Adaptive Rate Control & UDP Datagram Fragmenter
 
 @available(macOS 12.3, *)
 public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
     
     private var stream: SCStream?
+    private var streamConfig: SCStreamConfiguration?
     private var compressionSession: VTCompressionSession?
     private var udpConnection: NWConnection?
     
+    private let rateController = AdaptiveRateController()
     private let bufferPool = VideoFrameBufferPool(capacity: 16)
     private var currentFrameID: UInt32 = 0
     
@@ -72,15 +74,52 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
     private var formatDescriptionSent: Bool = false
     private var encodedFrameCount: Int = 0
     
-    private let maxMTUSize: Int = 1380 // 1400 MTU limit minus 8-byte datagram header + 12-byte Network framing overhead
+    private let maxMTUSize: Int = 1380
     
     public init(connection: NWConnection? = nil) {
         self.udpConnection = connection
         super.init()
+        setupRateControllerObserver()
     }
     
     public func updateUDPConnection(_ connection: NWConnection) {
         self.udpConnection = connection
+    }
+    
+    private func setupRateControllerObserver() {
+        rateController.onStateChange = { [weak self] newState in
+            self?.applyReconfiguration(newState: newState)
+        }
+    }
+    
+    // MARK: - Phase 3: Dynamic Pipeline Reconfiguration (SCK FPS & VideoToolbox Bitrate)
+    
+    private func applyReconfiguration(newState: MotionState) {
+        videoQueue.async { [weak self] in
+            guard let self = self else { return }
+            
+            // 1. Update VideoToolbox Compression Session Bitrate
+            if let session = self.compressionSession {
+                let targetBitrate = newState.targetBitrate as CFNumber
+                let status = VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: targetBitrate)
+                if status == noErr {
+                    logPrint("⚡️ MacHostVideoPipeline: Reconfigured VideoToolbox Bitrate -> \(newState.targetBitrate / 1_000_000) Mbps (\(newState))")
+                }
+            }
+            
+            // 2. Update ScreenCaptureKit Stream Minimum Frame Interval (FPS)
+            if let stream = self.stream, let config = self.streamConfig {
+                config.minimumFrameInterval = CMTime(value: 1, timescale: Int32(newState.targetFPS))
+                Task {
+                    do {
+                        try await stream.updateConfiguration(config)
+                        logPrint("🎥 MacHostVideoPipeline: Reconfigured ScreenCaptureKit Stream -> \(newState.targetFPS) FPS (\(newState))")
+                    } catch {
+                        logPrint("⚠️ MacHostVideoPipeline: Stream reconfiguration error: \(error)")
+                    }
+                }
+            }
+        }
     }
     
     // MARK: - Public Controls & Screen Capture Access
@@ -115,10 +154,12 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
             let config = SCStreamConfiguration()
             config.width = width
             config.height = height
-            config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 60) // Initial 60 FPS target
             config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
             config.showsCursor = false
             config.queueDepth = 3
+            
+            self.streamConfig = config
             
             let stream = SCStream(filter: filter, configuration: config, delegate: nil)
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
@@ -191,7 +232,7 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 60 as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 8_000_000 as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 6_000_000 as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_H264EntropyMode, value: kVTH264EntropyMode_CAVLC)
         
         VTCompressionSessionPrepareToEncodeFrames(session)
@@ -255,7 +296,6 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         
         let subType: UInt8 = isKeyframe ? 0x02 : 0x03
         
-        // 1. Allocate Ring Buffer Memory Slot
         let totalPayloadSize = 1 + totalLength
         let slotIndex = bufferPool.allocateSlot(size: totalPayloadSize, frameID: frameID, isKeyframe: isKeyframe)
         
@@ -265,7 +305,6 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         
         bufferPool.writeData(fullFramePayload, toSlot: slotIndex)
         
-        // 2. Dispatch MTU-Safe Datagram Fragments Over UDP Pipeline
         dispatchUDPFragments(frameID: frameID, payload: fullFramePayload)
         
         encodedFrameCount += 1
@@ -325,7 +364,7 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         
         guard let sps = spsHeader, let pps = ppsHeader else { return }
         
-        var payload = Data([0x01]) // Sub-type 0x01: Format Description
+        var payload = Data([0x01])
         
         let spsSizeUInt16 = UInt16(spsSize).bigEndian
         withUnsafeBytes(of: spsSizeUInt16) { payload.append(contentsOf: $0) }
@@ -341,13 +380,16 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
     }
 }
 
-// MARK: - SCStreamOutput Extension
+// MARK: - SCStreamOutput Extension with Zero-Cost Motion Analyzer Trigger
 
 @available(macOS 12.3, *)
 extension MacHostVideoPipeline: SCStreamOutput {
     public func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, sampleBuffer.isValid else { return }
         guard let imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
+        
+        // Zero-Cost Motion Analysis directly from frame metadata attachments (No pixel diffing!)
+        rateController.analyzeFrame(sampleBuffer: sampleBuffer)
         
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let duration = CMSampleBufferGetDuration(sampleBuffer)
