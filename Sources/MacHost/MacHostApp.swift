@@ -3,14 +3,7 @@ import Network
 import ApplicationServices
 import TailRemote
 
-// MARK: - Unbuffered Logging Helper
 
-public func logPrint(_ msg: String) {
-    let timestamp = ISO8601DateFormatter().string(from: Date())
-    let formatted = "[\(timestamp)] \(msg)\n"
-    fputs(formatted, stdout)
-    fflush(stdout)
-}
 
 // MARK: - Observable Server State Controller
 

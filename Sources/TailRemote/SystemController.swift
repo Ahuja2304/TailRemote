@@ -1,5 +1,15 @@
-#if os(macOS)
 import Foundation
+
+// MARK: - Unbuffered Logging Helper
+
+public func logPrint(_ msg: String) {
+    let timestamp = ISO8601DateFormatter().string(from: Date())
+    let formatted = "[\(timestamp)] \(msg)\n"
+    fputs(formatted, stdout)
+    fflush(stdout)
+}
+
+#if os(macOS)
 import AppKit
 
 // MARK: - System Command Types (Channel 0, Message 0x04)
