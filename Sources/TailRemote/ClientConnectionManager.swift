@@ -1,8 +1,12 @@
 import Foundation
 import Network
 import AVFoundation
+import QuartzCore
+import os.log
 
-// MARK: - Phase 3: Out-of-Order UDP Jitter Buffer with Graceful Degradation
+private let logger = OSLog(subsystem: "com.tailremote", category: "JitterBuffer")
+
+// MARK: - Phase 2: Aggressive 33ms TTL Out-of-Order UDP Jitter Buffer
 
 public final class UDPFrameJitterBuffer: @unchecked Sendable {
     private struct FrameAssemblySlot {
@@ -14,6 +18,7 @@ public final class UDPFrameJitterBuffer: @unchecked Sendable {
     private var buffer: [UInt32: FrameAssemblySlot] = [:]
     private var latestCompletedFrameID: UInt32 = 0
     private let lock = NSLock()
+    private let ttlSeconds: TimeInterval = 0.033 // Strict 33ms Time-To-Live threshold
     
     public init() {}
     
@@ -23,31 +28,41 @@ public final class UDPFrameJitterBuffer: @unchecked Sendable {
         
         let frameID = header.frameID
         
-        // 1. Graceful Degradation: Instantly drop fragments from older frames
-        if frameID < latestCompletedFrameID {
+        // 1. Instant Stale Purge: If fragment is from an older frame than already decoded, drop immediately
+        if frameID <= latestCompletedFrameID {
             return nil
         }
         
-        // Purge expired or stale frame assembly slots (Keep Jitter Buffer light & sub-15ms)
+        // 2. Aggressive Frame Purge: Purge all older incomplete frames (< frameID) to prioritize freshest frame
         purgeOlderSlots(than: frameID)
         
-        var slot = buffer[frameID] ?? FrameAssemblySlot(fragments: [:], totalFragments: header.totalFragments)
+        // 3. TTL Check: Purge any expired slot older than 33ms
+        if let existingSlot = buffer[frameID], Date().timeIntervalSince(existingSlot.timestamp) > ttlSeconds {
+            buffer.removeValue(forKey: frameID)
+            return nil
+        }
+        
+        var slot = buffer[frameID] ?? FrameAssemblySlot(fragments: [:], totalFragments: header.totalFragments, timestamp: Date())
         slot.fragments[header.fragmentID] = payload
         buffer[frameID] = slot
         
-        // 2. Check if all fragments for this frameID have arrived
+        // 4. Complete Frame Assembly
         if slot.fragments.count == Int(header.totalFragments) {
             var reassembledFrame = Data()
             for fragIndex in 0..<header.totalFragments {
                 if let fragData = slot.fragments[fragIndex] {
                     reassembledFrame.append(fragData)
                 } else {
-                    return nil // Incomplete payload
+                    return nil
                 }
             }
             
             latestCompletedFrameID = frameID
             buffer.removeValue(forKey: frameID)
+            
+            let timestamp = CACurrentMediaTime()
+            os_log("UDP Frame %u fully reassembled and passed to decoder at %.6f", log: logger, type: .info, frameID, timestamp)
+            
             return reassembledFrame
         }
         
@@ -55,14 +70,15 @@ public final class UDPFrameJitterBuffer: @unchecked Sendable {
     }
     
     private func purgeOlderSlots(than currentFrameID: UInt32) {
-        let keysToRemove = buffer.keys.filter { $0 < currentFrameID }
+        let now = Date()
+        let keysToRemove = buffer.keys.filter { $0 < currentFrameID || now.timeIntervalSince(buffer[$0]?.timestamp ?? now) > ttlSeconds }
         for key in keysToRemove {
             buffer.removeValue(forKey: key)
         }
     }
 }
 
-// MARK: - iOS Client Connection Manager & Hybrid TCP + UDP Transport
+// MARK: - iOS Client Connection Manager & Non-Blocking Hybrid Network Controller
 
 @MainActor
 public final class ClientConnectionManager: ObservableObject {
@@ -100,7 +116,7 @@ public final class ClientConnectionManager: ObservableObject {
         
         let targetHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
         
-        // 1. Setup TCP Connection for PIN Auth and Controls (Port 8088)
+        // 1. TCP Control/Input Connection
         let tcpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetHost), port: NWEndpoint.Port(rawValue: port)!)
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.noDelay = true
@@ -134,7 +150,7 @@ public final class ClientConnectionManager: ObservableObject {
         
         nwTCPConnection.start(queue: .global(qos: .userInteractive))
         
-        // 2. Setup UDP Connection for Video Stream Datagrams (Port 8089)
+        // 2. UDP Video Connection
         let udpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetHost), port: NWEndpoint.Port(rawValue: udpPort)!)
         let nwUDPConnection = NWConnection(to: udpEndpoint, using: .udp)
         self.udpConnection = nwUDPConnection
@@ -207,7 +223,7 @@ public final class ClientConnectionManager: ObservableObject {
         }
     }
     
-    // MARK: - UDP Video Receiver & Jitter Buffer Reassembly
+    // MARK: - UDP Video Receiver Loop
     
     private func receiveNextUDP() {
         guard let udpConnection = udpConnection else { return }
@@ -235,18 +251,18 @@ public final class ClientConnectionManager: ObservableObject {
         let videoData = payload.subdata(in: 1..<payload.count)
         
         switch subType {
-        case 0x01: // Format Description (SPS / PPS)
+        case 0x01:
             decoder?.handleFormatDescription(data: videoData)
-        case 0x02: // Keyframe
+        case 0x02:
             decoder?.handleVideoFrame(data: videoData, isKeyframe: true)
-        case 0x03: // P-Frame
+        case 0x03:
             decoder?.handleVideoFrame(data: videoData, isKeyframe: false)
         default:
             break
         }
     }
     
-    // MARK: - Send Mouse & Keyboard Input (TCP TLV Types 0x03 & 0x04)
+    // MARK: - Non-Blocking Background TCP Sends (Input Events)
     
     public func sendRelativeMove(dx: Float, dy: Float) {
         var payload = Data([0x01])

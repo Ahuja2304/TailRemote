@@ -33,22 +33,65 @@ public enum MotionState: Int, Comparable, Sendable {
     }
 }
 
-// MARK: - Phase 2: Zero-Cost Motion Analyzer & Debounced Rate Controller
+// MARK: - Phase 3: Zero-Cost Motion Analyzer & Input Wakeup Rate Controller
 
 @available(macOS 12.3, *)
 public final class AdaptiveRateController: @unchecked Sendable {
     private(set) public var currentState: MotionState = .highMotion
     private var pendingState: MotionState?
     private var debounceTask: Task<Void, Never>?
+    private var wakeupTask: Task<Void, Never>?
+    private var isWakeupActive: Bool = false
     private let lock = NSLock()
     
     public var onStateChange: ((MotionState) -> Void)?
     
     public init() {}
     
+    // MARK: - Phase 3: Instant Input Wakeup Heuristic (60 FPS Override for 1.0s)
+    
+    public func forceHighMotionWakeup(duration: TimeInterval = 1.0) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        isWakeupActive = true
+        debounceTask?.cancel()
+        debounceTask = nil
+        wakeupTask?.cancel()
+        
+        if currentState != .highMotion {
+            currentState = .highMotion
+            let targetState = currentState
+            DispatchQueue.main.async { [weak self] in
+                self?.onStateChange?(targetState)
+            }
+        }
+        
+        wakeupTask = Task { [weak self] in
+            let nanoseconds = UInt64(duration * 1_000_000_000)
+            try? await Task.sleep(nanoseconds: nanoseconds)
+            if !Task.isCancelled {
+                self?.resetWakeupActive()
+            }
+        }
+    }
+    
+    private func resetWakeupActive() {
+        lock.lock()
+        defer { lock.unlock() }
+        isWakeupActive = false
+    }
+    
     // MARK: - Zero-Cost Metadata Extraction (dirtyRects & contentRect)
     
     public func analyzeFrame(sampleBuffer: CMSampleBuffer) {
+        lock.lock()
+        if isWakeupActive {
+            lock.unlock()
+            return
+        }
+        lock.unlock()
+        
         guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[CFString: Any]],
               let firstAttachment = attachments.first else {
             return
@@ -99,7 +142,6 @@ public final class AdaptiveRateController: @unchecked Sendable {
         defer { lock.unlock() }
         
         if newState > currentState {
-            // Ramp-Up (Instant): Apply higher FPS & Bitrate immediately to eliminate lag
             debounceTask?.cancel()
             debounceTask = nil
             pendingState = nil
@@ -110,11 +152,10 @@ public final class AdaptiveRateController: @unchecked Sendable {
                 self?.onStateChange?(targetState)
             }
         } else if newState < currentState {
-            // Ramp-Down (Debounced 500ms): Wait 500ms to ensure motion has truly ceased
             pendingState = newState
             if debounceTask == nil {
                 debounceTask = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: 500_000_000) // 500ms debounce
+                    try? await Task.sleep(nanoseconds: 500_000_000)
                     if !Task.isCancelled {
                         self?.commitRampDownState()
                     }

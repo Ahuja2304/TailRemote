@@ -298,8 +298,10 @@ public final class MacHostSession: @unchecked Sendable {
         case .authenticated:
             switch type {
             case .mouseInput:
+                videoPipeline?.forceInputWakeup()
                 handleMouseInput(payload: payload)
             case .keyboardCommand:
+                videoPipeline?.forceInputWakeup()
                 handleKeyboardCommand(payload: payload)
             case .authPIN:
                 logPrint("ℹ️ MacHost: Session authenticated.")

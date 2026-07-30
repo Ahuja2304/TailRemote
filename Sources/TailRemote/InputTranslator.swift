@@ -1,6 +1,8 @@
 import Foundation
 import CoreGraphics
 import SwiftUI
+import QuartzCore
+import os.log
 
 #if canImport(UIKit)
 import UIKit
@@ -9,6 +11,8 @@ import UIKit
 #if os(macOS)
 import ApplicationServices
 #endif
+
+private let logger = OSLog(subsystem: "com.tailremote", category: "Diagnostics")
 
 // MARK: - Mouse Button & State Enums
 
@@ -60,7 +64,6 @@ public class KeyInputView: UIView, UIKeyInput, UITextInputTraits {
 
     public override var canBecomeFirstResponder: Bool { true }
     
-    // Aggressive Autocorrect / Autocapitalization Disabling
     public var autocorrectionType: UITextAutocorrectionType = .no
     public var autocapitalizationType: UITextAutocapitalizationType = .none
     public var smartDashesType: UITextSmartDashesType = .no
@@ -68,7 +71,6 @@ public class KeyInputView: UIView, UIKeyInput, UITextInputTraits {
     public var smartInsertDeleteType: UITextSmartInsertDeleteType = .no
     public var keyboardType: UIKeyboardType = .asciiCapable
 
-    // UIKeyInput Protocol requirement: always return true so deleteBackward is called even on empty buffer
     public var hasText: Bool { true }
     
     public func insertText(_ text: String) {
@@ -80,12 +82,12 @@ public class KeyInputView: UIView, UIKeyInput, UITextInputTraits {
     }
     
     public override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        return false // Block copy/paste/lookup context popups
+        return false
     }
 }
 #endif
 
-// MARK: - Zero-Latency Mac Trackpad Gesture View (1-Finger Move, 2-Finger Scroll)
+// MARK: - Phase 1: Zero-Latency Mac Trackpad Gesture View with Non-Blocking Background Network Sending
 
 #if os(iOS)
 public struct TailRemoteGestureView: UIViewRepresentable {
@@ -160,24 +162,20 @@ public class TrackpadUIView: UIView {
     required init?(coder: NSCoder) { fatalError("init(coder:) not implemented") }
     
     private func setupGestures() {
-        // 1. One-Finger Pan (Cursor Movement)
         let movePan = UIPanGestureRecognizer(target: self, action: #selector(handleMovePan(_:)))
         movePan.minimumNumberOfTouches = 1
         movePan.maximumNumberOfTouches = 1
         self.addGestureRecognizer(movePan)
         
-        // 2. Two-Finger Pan (Scrolling)
         let scrollPan = UIPanGestureRecognizer(target: self, action: #selector(handleScrollPan(_:)))
         scrollPan.minimumNumberOfTouches = 2
         scrollPan.maximumNumberOfTouches = 2
         self.addGestureRecognizer(scrollPan)
         
-        // 3. One-Finger Tap (Left Click)
         let leftTap = UITapGestureRecognizer(target: self, action: #selector(handleLeftTap(_:)))
         leftTap.require(toFail: scrollPan)
         self.addGestureRecognizer(leftTap)
         
-        // 4. Two-Finger Tap (Right Click)
         let rightTap = UITapGestureRecognizer(target: self, action: #selector(handleRightTap(_:)))
         rightTap.numberOfTouchesRequired = 2
         self.addGestureRecognizer(rightTap)
@@ -187,26 +185,41 @@ public class TrackpadUIView: UIView {
         onUserInteraction?()
         let location = sender.location(in: self)
         
-        // 1. Immediate 120Hz Local Cursor Update (Zero Perceived Latency)
+        // 1. Immediate 120Hz Local Cursor Update on Main Thread (Zero Latency)
         onLocalCursorMove?(location)
         
-        // 2. 16.6ms Throttler Buffer (60Hz Network Rate Control)
+        // Handle gesture end / cancel cleanly
+        if sender.state == .ended || sender.state == .cancelled {
+            lastDispatchTime = .distantPast
+            return
+        }
+        
+        // 2. 16.6ms Throttler Check
         let now = Date()
-        guard now.timeIntervalSince(lastDispatchTime) >= 0.0166667 || sender.state == .ended else {
+        guard now.timeIntervalSince(lastDispatchTime) >= 0.0166667 else {
             return
         }
         lastDispatchTime = now
         
-        if mode == .trackpadRelative {
-            let translation = sender.translation(in: self)
-            if translation != .zero {
-                onRelativeMove?(Float(translation.x), Float(translation.y))
-                sender.setTranslation(.zero, in: self)
+        let currentMode = mode
+        let translation = sender.translation(in: self)
+        let boundsSize = bounds
+        sender.setTranslation(.zero, in: self)
+        
+        // Phase 1 & 4: Dispatch TCP network call off Main Thread to background queue + High-precision Telemetry
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            let timestamp = CACurrentMediaTime()
+            os_log("Touch detected at %.6f -> Sent over TCP", log: logger, type: .info, timestamp)
+            
+            if currentMode == .trackpadRelative {
+                if translation != .zero {
+                    self?.onRelativeMove?(Float(translation.x), Float(translation.y))
+                }
+            } else if currentMode == .directTouchAbsolute {
+                let normX = max(0.0, min(1.0, Float(location.x / boundsSize.width)))
+                let normY = max(0.0, min(1.0, Float(location.y / boundsSize.height)))
+                self?.onAbsoluteMove?(normX, normY)
             }
-        } else if mode == .directTouchAbsolute {
-            let normX = max(0.0, min(1.0, Float(location.x / bounds.width)))
-            let normY = max(0.0, min(1.0, Float(location.y / bounds.height)))
-            onAbsoluteMove?(normX, normY)
         }
     }
     
@@ -214,29 +227,36 @@ public class TrackpadUIView: UIView {
         onUserInteraction?()
         let translation = sender.translation(in: self)
         if translation != .zero {
-            onScroll?(Float(translation.x), Float(translation.y))
             sender.setTranslation(.zero, in: self)
+            DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+                self?.onScroll?(Float(translation.x), Float(translation.y))
+            }
         }
     }
     
     @objc private func handleLeftTap(_ sender: UITapGestureRecognizer) {
         onUserInteraction?()
-        if mode == .directTouchAbsolute {
-            let location = sender.location(in: self)
-            let normX = max(0.0, min(1.0, Float(location.x / bounds.width)))
-            let normY = max(0.0, min(1.0, Float(location.y / bounds.height)))
-            onAbsoluteMove?(normX, normY)
-        }
-        onMouseButton?(.left, .down)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+        let location = sender.location(in: self)
+        let boundsSize = bounds
+        let currentMode = mode
+        
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            if currentMode == .directTouchAbsolute {
+                let normX = max(0.0, min(1.0, Float(location.x / boundsSize.width)))
+                let normY = max(0.0, min(1.0, Float(location.y / boundsSize.height)))
+                self?.onAbsoluteMove?(normX, normY)
+            }
+            self?.onMouseButton?(.left, .down)
+            Thread.sleep(forTimeInterval: 0.05)
             self?.onMouseButton?(.left, .up)
         }
     }
     
     @objc private func handleRightTap(_ sender: UITapGestureRecognizer) {
         onUserInteraction?()
-        onMouseButton?(.right, .down)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+        DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+            self?.onMouseButton?(.right, .down)
+            Thread.sleep(forTimeInterval: 0.05)
             self?.onMouseButton?(.right, .up)
         }
     }
@@ -253,7 +273,7 @@ public struct MacInputInjector {
     public static func checkAccessibilityPermissions() -> Bool {
         let trusted = AXIsProcessTrusted()
         if !trusted {
-            logPrint("⚠️ macOS Input Warning: Accessibility permission NOT granted! Remote mouse clicks and keyboard events will be blocked by macOS. Please enable Accessibility permission in System Settings > Privacy & Security > Accessibility for Terminal/MacHost.")
+            logPrint("⚠️ macOS Input Warning: Accessibility permission NOT granted!")
         }
         return trusted
     }
@@ -263,7 +283,6 @@ public struct MacInputInjector {
         let bounds = CGDisplayBounds(CGMainDisplayID())
         let now = Date()
         
-        // Re-sync with hardware Quartz location if idle for > 200ms or first move
         if let lastTime = lastEventTime, now.timeIntervalSince(lastTime) < 0.2, let currentVirtual = virtualCursorPos {
             virtualCursorPos = currentVirtual
         } else {
@@ -275,6 +294,9 @@ public struct MacInputInjector {
         current.x = max(0, min(bounds.width, current.x + CGFloat(dx)))
         current.y = max(0, min(bounds.height, current.y + CGFloat(dy)))
         virtualCursorPos = current
+        
+        let timestamp = CACurrentMediaTime()
+        os_log("Input received at %.6f -> CGEvent injected", log: logger, type: .info, timestamp)
         
         let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: current, mouseButton: .left)
         moveEvent?.setIntegerValueField(.mouseEventDeltaX, value: Int64(dx))
@@ -289,7 +311,7 @@ public struct MacInputInjector {
         let targetX = max(0, min(screenWidth, CGFloat(normalizedX) * screenWidth))
         let targetY: CGFloat
         if normalizedY <= 0.01 {
-            targetY = -20 // Top Menu Bar Overdrive
+            targetY = -20
         } else {
             targetY = max(0, min(screenHeight, CGFloat(normalizedY) * screenHeight))
         }
@@ -300,6 +322,9 @@ public struct MacInputInjector {
         
         let deltaX = targetX - currentPos.x
         let deltaY = targetY - currentPos.y
+        
+        let timestamp = CACurrentMediaTime()
+        os_log("Input received at %.6f -> CGEvent injected", log: logger, type: .info, timestamp)
         
         let moveEvent = CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: targetPoint, mouseButton: .left)
         moveEvent?.setIntegerValueField(.mouseEventDeltaX, value: Int64(deltaX))
@@ -334,18 +359,26 @@ public struct MacInputInjector {
             cgButton = .center
         }
         
+        let timestamp = CACurrentMediaTime()
+        os_log("Input received at %.6f -> CGEvent injected", log: logger, type: .info, timestamp)
+        
         let mouseEvent = CGEvent(mouseEventSource: nil, mouseType: eventType, mouseCursorPosition: currentPos, mouseButton: cgButton)
         mouseEvent?.post(tap: .cghidEventTap)
     }
     
     public static func injectScroll(scrollDx: Float, scrollDy: Float) {
         _ = checkAccessibilityPermissions()
+        let timestamp = CACurrentMediaTime()
+        os_log("Input received at %.6f -> CGEvent injected", log: logger, type: .info, timestamp)
+        
         let scrollEvent = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: Int32(scrollDy), wheel2: Int32(scrollDx), wheel3: 0)
         scrollEvent?.post(tap: .cghidEventTap)
     }
     
     public static func injectKeystroke(_ charStr: String) {
         _ = checkAccessibilityPermissions()
+        let timestamp = CACurrentMediaTime()
+        os_log("Input received at %.6f -> CGEvent injected", log: logger, type: .info, timestamp)
         
         if charStr == "\u{7F}" || charStr == "\u{08}" {
             let keyDown = CGEvent(keyboardEventSource: nil, virtualKey: 51, keyDown: true)

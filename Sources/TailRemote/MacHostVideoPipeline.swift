@@ -190,6 +190,10 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         }
     }
     
+    public func forceInputWakeup() {
+        rateController.forceHighMotionWakeup()
+    }
+    
     public func updateConnectionReadiness(isBufferFull: Bool) {
         videoQueue.async { [weak self] in
             self?.isBufferFull = isBufferFull
