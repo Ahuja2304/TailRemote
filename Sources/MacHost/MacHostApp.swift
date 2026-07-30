@@ -1,7 +1,6 @@
 import SwiftUI
 import Network
 import ApplicationServices
-import TailRemote
 
 
 

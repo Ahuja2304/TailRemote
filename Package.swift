@@ -11,21 +11,14 @@ let package = Package(
         .executable(
             name: "MacHost",
             targets: ["MacHost"]
-        ),
-        .library(
-            name: "TailRemote",
-            targets: ["TailRemote"]
         )
     ],
     targets: [
-        .target(
-            name: "TailRemote",
-            path: "Sources/TailRemote"
-        ),
         .executableTarget(
             name: "MacHost",
-            dependencies: ["TailRemote"],
-            path: "Sources/MacHost"
+            path: "Sources",
+            exclude: ["TailRemoteiOS"],
+            sources: ["TailRemote", "MacHost"]
         )
     ]
 )
