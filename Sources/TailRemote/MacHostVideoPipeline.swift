@@ -7,34 +7,90 @@ import Network
 import Dispatch
 import CoreGraphics
 
-// MARK: - MacHost Video Pipeline Manager
+// MARK: - Phase 2: MacHost Zero-Copy Ring Buffer Memory Pool
+
+public final class VideoFrameBufferPool: @unchecked Sendable {
+    public struct BufferSlot {
+        public var data: Data
+        public var frameID: UInt32
+        public var isKeyframe: Bool
+        public var isUsed: Bool
+    }
+    
+    private let capacity: Int
+    private var slots: [BufferSlot]
+    private var writeIndex: Int = 0
+    private let lock = NSLock()
+    
+    public init(capacity: Int = 16) {
+        self.capacity = capacity
+        self.slots = Array(repeating: BufferSlot(data: Data(), frameID: 0, isKeyframe: false, isUsed: false), count: capacity)
+    }
+    
+    public func allocateSlot(size: Int, frameID: UInt32, isKeyframe: Bool) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        let index = writeIndex
+        slots[index].data.removeAll(keepingCapacity: true)
+        slots[index].data.reserveCapacity(size)
+        slots[index].frameID = frameID
+        slots[index].isKeyframe = isKeyframe
+        slots[index].isUsed = true
+        
+        writeIndex = (writeIndex + 1) % capacity
+        return index
+    }
+    
+    public func writeData(_ data: Data, toSlot index: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        slots[index].data.append(data)
+    }
+    
+    public func getSlot(_ index: Int) -> BufferSlot {
+        lock.lock()
+        defer { lock.unlock() }
+        return slots[index]
+    }
+}
+
+// MARK: - MacHost Video Pipeline Manager with UDP Datagram Fragmenter
 
 @available(macOS 12.3, *)
 public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
     
     private var stream: SCStream?
     private var compressionSession: VTCompressionSession?
-    private var connection: NWConnection?
+    private var udpConnection: NWConnection?
+    
+    private let bufferPool = VideoFrameBufferPool(capacity: 16)
+    private var currentFrameID: UInt32 = 0
     
     private let videoQueue = DispatchQueue(label: "com.tailremote.video.pipeline", qos: .userInteractive)
     private var isBufferFull: Bool = false
     private var formatDescriptionSent: Bool = false
     private var encodedFrameCount: Int = 0
     
+    private let maxMTUSize: Int = 1380 // 1400 MTU limit minus 8-byte datagram header + 12-byte Network framing overhead
+    
     public init(connection: NWConnection? = nil) {
-        self.connection = connection
+        self.udpConnection = connection
         super.init()
     }
     
-    // MARK: - Public Controls & Explicit macOS Screen Capture Access Preflight
+    public func updateUDPConnection(_ connection: NWConnection) {
+        self.udpConnection = connection
+    }
+    
+    // MARK: - Public Controls & Screen Capture Access
     
     public func startCapture() async throws {
-        // Fix 1: Explicit Screen Recording Permission Preflight Check
         if !CGPreflightScreenCaptureAccess() {
             logPrint("⚠️ MacHostVideoPipeline: Screen Recording permission missing! Requesting access...")
             let granted = CGRequestScreenCaptureAccess()
             if !granted {
-                logPrint("❌ MacHostVideoPipeline: Screen Recording permission DENIED by user. Open System Settings > Privacy & Security > Screen Recording and allow Terminal/MacHost.")
+                logPrint("❌ MacHostVideoPipeline: Screen Recording permission DENIED by user. Allow Terminal/MacHost in System Settings > Privacy & Security > Screen Recording.")
                 throw NSError(domain: "MacHostVideoPipeline", code: -403, userInfo: [NSLocalizedDescriptionKey: "Screen Recording permission denied by user."])
             }
         }
@@ -46,32 +102,30 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
                 throw NSError(domain: "MacHostVideoPipeline", code: -1, userInfo: [NSLocalizedDescriptionKey: "No primary display found"])
             }
             
-            // 1. Initialize VTCompressionSession for H.264 Encoding with resolution scaling
             let rawWidth = primaryDisplay.width
             let rawHeight = primaryDisplay.height
             let maxDim: CGFloat = 1920.0
             let scale = min(1.0, maxDim / CGFloat(max(rawWidth, rawHeight)))
-            let width = (Int(CGFloat(rawWidth) * scale) / 2) * 2 // Ensure even dimensions for H.264
+            let width = (Int(CGFloat(rawWidth) * scale) / 2) * 2
             let height = (Int(CGFloat(rawHeight) * scale) / 2) * 2
             
             try setupCompressionSession(width: Int32(width), height: Int32(height))
             
-            // 2. Configure ScreenCaptureKit Stream
             let filter = SCContentFilter(display: primaryDisplay, excludingApplications: [], exceptingWindows: [])
             let config = SCStreamConfiguration()
             config.width = width
             config.height = height
-            config.minimumFrameInterval = CMTime(value: 1, timescale: 60) // 60 FPS target
+            config.minimumFrameInterval = CMTime(value: 1, timescale: 60)
             config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-            config.showsCursor = false // Hide hardware host cursor to allow iOS Local Cursor Rendering
-            config.queueDepth = 3 // Minimal queue depth to eliminate frame accumulation latency
+            config.showsCursor = false
+            config.queueDepth = 3
             
             let stream = SCStream(filter: filter, configuration: config, delegate: nil)
             try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: videoQueue)
             try await stream.startCapture()
             
             self.stream = stream
-            logPrint("🎥 MacHostVideoPipeline: ScreenCaptureKit capture started @ 60 FPS (\(width)x\(height) [Native: \(rawWidth)x\(rawHeight)])")
+            logPrint("🎥 MacHostVideoPipeline: ScreenCaptureKit capture started @ 60 FPS UDP Transport (\(width)x\(height))")
         } catch {
             logPrint("❌ MacHostVideoPipeline: ScreenCaptureKit Error: \(error)")
             throw error
@@ -137,14 +191,12 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ProfileLevel, value: kVTProfileLevel_H264_Main_AutoLevel)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_MaxKeyFrameInterval, value: 60 as CFNumber)
         VTSessionSetProperty(session, key: kVTCompressionPropertyKey_ExpectedFrameRate, value: 60 as CFNumber)
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 8_000_000 as CFNumber) // 8 Mbps target
-        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_H264EntropyMode, value: kVTH264EntropyMode_CAVLC) // Fast CAVLC entropy decoding
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_AverageBitRate, value: 8_000_000 as CFNumber)
+        VTSessionSetProperty(session, key: kVTCompressionPropertyKey_H264EntropyMode, value: kVTH264EntropyMode_CAVLC)
         
         VTCompressionSessionPrepareToEncodeFrames(session)
         self.compressionSession = session
     }
-    
-    // MARK: - Encode Frame
     
     private func encodeFrame(cvImageBuffer: CVImageBuffer, presentationTimeStamp: CMTime, duration: CMTime) {
         guard let session = compressionSession else { return }
@@ -167,7 +219,7 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         )
     }
     
-    // MARK: - Zero-Copy NAL Unit Extraction & Congestion Control
+    // MARK: - Zero-Copy Ring Buffer & UDP Datagram Fragmenter
     
     private func handleEncodedFrame(sampleBuffer: CMSampleBuffer, flags: VTEncodeInfoFlags) {
         let isKeyframe: Bool
@@ -198,17 +250,49 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         
         guard blockBufferStatus == noErr, let rawDataPointer = dataPointer, totalLength > 0 else { return }
         
-        let rawBuffer = UnsafeRawBufferPointer(start: rawDataPointer, count: totalLength)
+        currentFrameID += 1
+        let frameID = currentFrameID
+        
         let subType: UInt8 = isKeyframe ? 0x02 : 0x03
-        var payload = Data([subType])
-        payload.append(contentsOf: rawBuffer)
         
-        sendVideoPacket(payload: payload)
+        // 1. Allocate Ring Buffer Memory Slot
+        let totalPayloadSize = 1 + totalLength
+        let slotIndex = bufferPool.allocateSlot(size: totalPayloadSize, frameID: frameID, isKeyframe: isKeyframe)
         
-        // Fix 3: Host Pipeline Throttle Logging (Once every 60 frames)
+        var fullFramePayload = Data([subType])
+        let rawBuffer = UnsafeRawBufferPointer(start: rawDataPointer, count: totalLength)
+        fullFramePayload.append(contentsOf: rawBuffer)
+        
+        bufferPool.writeData(fullFramePayload, toSlot: slotIndex)
+        
+        // 2. Dispatch MTU-Safe Datagram Fragments Over UDP Pipeline
+        dispatchUDPFragments(frameID: frameID, payload: fullFramePayload)
+        
         encodedFrameCount += 1
         if encodedFrameCount % 60 == 0 {
-            logPrint("Host Pipeline: Encoded & transmitted \(encodedFrameCount) H.264 video frames over network")
+            logPrint("Host Pipeline (UDP): Encoded & Fragmented \(encodedFrameCount) video frames over UDP socket")
+        }
+    }
+    
+    private func dispatchUDPFragments(frameID: UInt32, payload: Data) {
+        guard let connection = udpConnection else { return }
+        
+        let totalLength = payload.count
+        let totalFragments = UInt16(ceil(Double(totalLength) / Double(maxMTUSize)))
+        
+        for fragID in 0..<totalFragments {
+            let offset = Int(fragID) * maxMTUSize
+            let chunkLength = min(maxMTUSize, totalLength - offset)
+            let chunkData = payload.subdata(in: offset..<(offset + chunkLength))
+            
+            let header = UDPVideoDatagramHeader(frameID: frameID, fragmentID: fragID, totalFragments: totalFragments)
+            var packet = header.serialize()
+            packet.append(chunkData)
+            
+            packet.withUnsafeBytes { rawBuffer in
+                let dispatchData = DispatchData(bytes: rawBuffer)
+                connection.send(content: dispatchData, completion: .idempotent)
+            }
         }
     }
     
@@ -251,20 +335,9 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         withUnsafeBytes(of: ppsSizeUInt16) { payload.append(contentsOf: $0) }
         payload.append(pps, count: ppsSize)
         
-        sendVideoPacket(payload: payload)
-        logPrint("🎥 MacHostVideoPipeline: Transmitted SPS/PPS Format Description (\(spsSize) SPS bytes, \(ppsSize) PPS bytes)")
-    }
-    
-    private func sendVideoPacket(payload: Data) {
-        guard let connection = connection else { return }
-        
-        let message = NWProtocolFramer.Message(type: .videoFrame)
-        let context = NWConnection.ContentContext(identifier: "VideoPacket", metadata: [message])
-        
-        payload.withUnsafeBytes { rawBuffer in
-            let dispatchData = DispatchData(bytes: rawBuffer)
-            connection.send(content: dispatchData, contentContext: context, isComplete: true, completion: .idempotent)
-        }
+        currentFrameID += 1
+        dispatchUDPFragments(frameID: currentFrameID, payload: payload)
+        logPrint("🎥 MacHostVideoPipeline (UDP): Transmitted SPS/PPS Format Description (\(spsSize) SPS bytes, \(ppsSize) PPS bytes)")
     }
 }
 

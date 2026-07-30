@@ -2,7 +2,67 @@ import Foundation
 import Network
 import AVFoundation
 
-// MARK: - iOS Client Connection Manager & TLV Serializer
+// MARK: - Phase 3: Out-of-Order UDP Jitter Buffer with Graceful Degradation
+
+public final class UDPFrameJitterBuffer: @unchecked Sendable {
+    private struct FrameAssemblySlot {
+        var fragments: [UInt16: Data] = [:]
+        var totalFragments: UInt16
+        var timestamp: Date = Date()
+    }
+    
+    private var buffer: [UInt32: FrameAssemblySlot] = [:]
+    private var latestCompletedFrameID: UInt32 = 0
+    private let lock = NSLock()
+    
+    public init() {}
+    
+    public func ingestFragment(header: UDPVideoDatagramHeader, payload: Data) -> Data? {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        let frameID = header.frameID
+        
+        // 1. Graceful Degradation: Instantly drop fragments from older frames
+        if frameID < latestCompletedFrameID {
+            return nil
+        }
+        
+        // Purge expired or stale frame assembly slots (Keep Jitter Buffer light & sub-15ms)
+        purgeOlderSlots(than: frameID)
+        
+        var slot = buffer[frameID] ?? FrameAssemblySlot(fragments: [:], totalFragments: header.totalFragments)
+        slot.fragments[header.fragmentID] = payload
+        buffer[frameID] = slot
+        
+        // 2. Check if all fragments for this frameID have arrived
+        if slot.fragments.count == Int(header.totalFragments) {
+            var reassembledFrame = Data()
+            for fragIndex in 0..<header.totalFragments {
+                if let fragData = slot.fragments[fragIndex] {
+                    reassembledFrame.append(fragData)
+                } else {
+                    return nil // Incomplete payload
+                }
+            }
+            
+            latestCompletedFrameID = frameID
+            buffer.removeValue(forKey: frameID)
+            return reassembledFrame
+        }
+        
+        return nil
+    }
+    
+    private func purgeOlderSlots(than currentFrameID: UInt32) {
+        let keysToRemove = buffer.keys.filter { $0 < currentFrameID }
+        for key in keysToRemove {
+            buffer.removeValue(forKey: key)
+        }
+    }
+}
+
+// MARK: - iOS Client Connection Manager & Hybrid TCP + UDP Transport
 
 @MainActor
 public final class ClientConnectionManager: ObservableObject {
@@ -11,11 +71,15 @@ public final class ClientConnectionManager: ObservableObject {
     @Published public var authFailed: Bool = false
     @Published public var hostIP: String = "Quintessa.local"
     @Published public var port: UInt16 = 8088
+    @Published public var udpPort: UInt16 = 8089
     @Published public var remoteFiles: [String] = []
     
     public let displayLayer = AVSampleBufferDisplayLayer()
     private var decoder: iPhoneClientVideoDecoder?
-    private var connection: NWConnection?
+    
+    private var tcpConnection: NWConnection?
+    private var udpConnection: NWConnection?
+    private let jitterBuffer = UDPFrameJitterBuffer()
     
     public init() {
         let videoDecoder = iPhoneClientVideoDecoder(displayLayer: displayLayer)
@@ -27,35 +91,36 @@ public final class ClientConnectionManager: ObservableObject {
         }
     }
     
-    public func connect(host: String, port: UInt16) {
+    public func connect(host: String, port: UInt16 = 8088, udpPort: UInt16 = 8089) {
         self.hostIP = host
         self.port = port
+        self.udpPort = udpPort
         self.isAuthenticated = false
         self.authFailed = false
         
         let targetHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        let endpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetHost), port: NWEndpoint.Port(rawValue: port)!)
         
+        // 1. Setup TCP Connection for PIN Auth and Controls (Port 8088)
+        let tcpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetHost), port: NWEndpoint.Port(rawValue: port)!)
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.noDelay = true
-        let parameters = NWParameters(tls: nil, tcp: tcpOptions)
+        let tcpParameters = NWParameters(tls: nil, tcp: tcpOptions)
         
-        // TLV Protocol Framer Setup
         let framerOption = NWProtocolFramer.Options(definition: TailRemoteFramer.definition)
-        parameters.defaultProtocolStack.applicationProtocols.insert(framerOption, at: 0)
+        tcpParameters.defaultProtocolStack.applicationProtocols.insert(framerOption, at: 0)
         
-        let nwConnection = NWConnection(to: endpoint, using: parameters)
-        self.connection = nwConnection
+        let nwTCPConnection = NWConnection(to: tcpEndpoint, using: tcpParameters)
+        self.tcpConnection = nwTCPConnection
         
-        nwConnection.stateUpdateHandler = { [weak self] state in
+        nwTCPConnection.stateUpdateHandler = { [weak self] state in
             DispatchQueue.main.async {
                 switch state {
                 case .ready:
-                    print("✅ iPhone: Connected to Mac Host at \(targetHost):\(port). Awaiting PIN entry...")
+                    print("✅ iPhone: Connected TCP Control Channel (\(targetHost):\(port)).")
                     self?.isConnected = true
-                    self?.receiveNextTLV()
+                    self?.receiveNextTCP()
                 case .failed(let error):
-                    print("❌ iPhone: Connection failed to \(targetHost):\(port) - Error: \(error)")
+                    print("❌ iPhone: TCP Connection failed: \(error)")
                     self?.isConnected = false
                     self?.isAuthenticated = false
                 case .cancelled:
@@ -67,28 +132,44 @@ public final class ClientConnectionManager: ObservableObject {
             }
         }
         
-        nwConnection.start(queue: .global(qos: .userInteractive))
+        nwTCPConnection.start(queue: .global(qos: .userInteractive))
+        
+        // 2. Setup UDP Connection for Video Stream Datagrams (Port 8089)
+        let udpEndpoint = NWEndpoint.hostPort(host: NWEndpoint.Host(targetHost), port: NWEndpoint.Port(rawValue: udpPort)!)
+        let nwUDPConnection = NWConnection(to: udpEndpoint, using: .udp)
+        self.udpConnection = nwUDPConnection
+        
+        nwUDPConnection.stateUpdateHandler = { state in
+            if state == .ready {
+                print("📡 iPhone: UDP Video Socket READY (\(targetHost):\(udpPort)).")
+            }
+        }
+        
+        nwUDPConnection.start(queue: .global(qos: .userInteractive))
+        receiveNextUDP()
     }
     
     public func disconnect() {
-        connection?.cancel()
-        connection = nil
+        tcpConnection?.cancel()
+        tcpConnection = nil
+        udpConnection?.cancel()
+        udpConnection = nil
         isConnected = false
         isAuthenticated = false
         authFailed = false
     }
     
-    // MARK: - Handshake PIN Authenticator (TLV Type 0x01)
+    // MARK: - Handshake PIN Authenticator (TCP TLV Type 0x01)
     
     public func authenticate(pin: String) {
         guard let pinData = pin.data(using: .utf8) else { return }
-        sendTLV(type: .authPIN, payload: pinData)
+        sendTCP(type: .authPIN, payload: pinData)
     }
     
-    // MARK: - Recursive TLV Receiver Loop
+    // MARK: - TCP Receiver Loop
     
-    private func receiveNextTLV() {
-        guard let connection = connection else { return }
+    private func receiveNextTCP() {
+        guard let connection = tcpConnection else { return }
         
         connection.receiveMessage { [weak self] content, context, isComplete, error in
             guard let self = self, error == nil, let content = content else { return }
@@ -98,17 +179,17 @@ public final class ClientConnectionManager: ObservableObject {
                let msgType = TailRemoteMessageType(rawValue: msgTypeRaw) {
                 
                 Task { @MainActor in
-                    self.processInboundTLV(type: msgType, payload: content)
+                    self.processInboundTCP(type: msgType, payload: content)
                 }
             }
             
             Task { @MainActor in
-                self.receiveNextTLV()
+                self.receiveNextTCP()
             }
         }
     }
     
-    private func processInboundTLV(type: TailRemoteMessageType, payload: Data) {
+    private func processInboundTCP(type: TailRemoteMessageType, payload: Data) {
         switch type {
         case .authPIN:
             if payload.first == 0x01 {
@@ -121,68 +202,87 @@ public final class ClientConnectionManager: ObservableObject {
                 self.isAuthenticated = false
                 self.authFailed = true
             }
-            
-        case .videoFrame:
-            guard payload.count >= 1 else { return }
-            let subType = payload[0]
-            let videoData = payload.subdata(in: 1..<payload.count)
-            
-            switch subType {
-            case 0x01: // Format Description
-                decoder?.handleFormatDescription(data: videoData)
-            case 0x02: // Keyframe
-                decoder?.handleVideoFrame(data: videoData, isKeyframe: true)
-            case 0x03: // P-Frame
-                decoder?.handleVideoFrame(data: videoData, isKeyframe: false)
-            default:
-                break
-            }
-            
         default:
             break
         }
     }
     
-    // MARK: - Send Mouse & Keyboard Input (TLV Types 0x03 & 0x04)
+    // MARK: - UDP Video Receiver & Jitter Buffer Reassembly
+    
+    private func receiveNextUDP() {
+        guard let udpConnection = udpConnection else { return }
+        
+        udpConnection.receive(minimumIncompleteLength: 1, maximumLength: 2048) { [weak self] content, context, isComplete, error in
+            guard let self = self else { return }
+            
+            if let data = content, let parsed = UDPVideoDatagramHeader.parse(from: data) {
+                if let completeFrame = self.jitterBuffer.ingestFragment(header: parsed.header, payload: parsed.payload) {
+                    Task { @MainActor in
+                        self.processCompleteVideoFrame(payload: completeFrame)
+                    }
+                }
+            }
+            
+            Task { @MainActor in
+                self.receiveNextUDP()
+            }
+        }
+    }
+    
+    private func processCompleteVideoFrame(payload: Data) {
+        guard payload.count >= 1 else { return }
+        let subType = payload[0]
+        let videoData = payload.subdata(in: 1..<payload.count)
+        
+        switch subType {
+        case 0x01: // Format Description (SPS / PPS)
+            decoder?.handleFormatDescription(data: videoData)
+        case 0x02: // Keyframe
+            decoder?.handleVideoFrame(data: videoData, isKeyframe: true)
+        case 0x03: // P-Frame
+            decoder?.handleVideoFrame(data: videoData, isKeyframe: false)
+        default:
+            break
+        }
+    }
+    
+    // MARK: - Send Mouse & Keyboard Input (TCP TLV Types 0x03 & 0x04)
     
     public func sendRelativeMove(dx: Float, dy: Float) {
-        var payload = Data([0x01]) // Sub-type 0x01: Relative Move
+        var payload = Data([0x01])
         var dxBE = dx.bitPattern.bigEndian
         var dyBE = dy.bitPattern.bigEndian
         withUnsafeBytes(of: &dxBE) { payload.append(contentsOf: $0) }
         withUnsafeBytes(of: &dyBE) { payload.append(contentsOf: $0) }
-        
-        sendTLV(type: .mouseInput, payload: payload)
+        sendTCP(type: .mouseInput, payload: payload)
     }
     
     public func sendAbsoluteMove(normalizedX: Float, normalizedY: Float) {
-        var payload = Data([0x02]) // Sub-type 0x02: Absolute Move
+        var payload = Data([0x02])
         var xBE = normalizedX.bitPattern.bigEndian
         var yBE = normalizedY.bitPattern.bigEndian
         withUnsafeBytes(of: &xBE) { payload.append(contentsOf: $0) }
         withUnsafeBytes(of: &yBE) { payload.append(contentsOf: $0) }
-        
-        sendTLV(type: .mouseInput, payload: payload)
+        sendTCP(type: .mouseInput, payload: payload)
     }
     
     public func sendMouseButton(button: MouseButtonType, state: MouseButtonState) {
-        let payload = Data([0x03, button.rawValue, state.rawValue]) // Sub-type 0x03: Mouse Button
-        sendTLV(type: .mouseInput, payload: payload)
+        let payload = Data([0x03, button.rawValue, state.rawValue])
+        sendTCP(type: .mouseInput, payload: payload)
     }
     
     public func sendScroll(scrollDx: Float, scrollDy: Float) {
-        var payload = Data([0x04]) // Sub-type 0x04: Scroll Event
+        var payload = Data([0x04])
         var dxBE = scrollDx.bitPattern.bigEndian
         var dyBE = scrollDy.bitPattern.bigEndian
         withUnsafeBytes(of: &dxBE) { payload.append(contentsOf: $0) }
         withUnsafeBytes(of: &dyBE) { payload.append(contentsOf: $0) }
-        
-        sendTLV(type: .mouseInput, payload: payload)
+        sendTCP(type: .mouseInput, payload: payload)
     }
     
     public func sendKeystroke(_ char: String) {
         guard let data = char.data(using: .utf8) else { return }
-        sendTLV(type: .keyboardCommand, payload: data)
+        sendTCP(type: .keyboardCommand, payload: data)
     }
     
     public func requestKeystroke(_ char: String) {
@@ -191,20 +291,18 @@ public final class ClientConnectionManager: ObservableObject {
     
     public func requestDirectoryList(path: String = "~/") {
         guard let data = path.data(using: .utf8) else { return }
-        sendTLV(type: .authPIN, payload: data)
+        sendTCP(type: .authPIN, payload: data)
     }
     
     public func requestIDRKeyframe() {
-        sendTLV(type: .authPIN, payload: Data("PING".utf8))
+        sendTCP(type: .authPIN, payload: Data("PING".utf8))
     }
     
-    // MARK: - Single Contiguous Data TLV Serializer
-    
-    private func sendTLV(type: TailRemoteMessageType, payload: Data) {
-        guard let connection = connection else { return }
+    private func sendTCP(type: TailRemoteMessageType, payload: Data) {
+        guard let connection = tcpConnection else { return }
         
         let message = NWProtocolFramer.Message(type: type)
-        let context = NWConnection.ContentContext(identifier: "ClientTLV", metadata: [message])
+        let context = NWConnection.ContentContext(identifier: "ClientTCP", metadata: [message])
         
         payload.withUnsafeBytes { rawBuffer in
             let dispatchData = DispatchData(bytes: rawBuffer)

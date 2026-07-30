@@ -23,6 +23,49 @@ public struct TailRemoteHeader {
     }
 }
 
+// MARK: - UDP Datagram Fragment Header Structure (8 Bytes Total)
+
+public struct UDPVideoDatagramHeader {
+    public let frameID: UInt32
+    public let fragmentID: UInt16
+    public let totalFragments: UInt16
+    
+    public init(frameID: UInt32, fragmentID: UInt16, totalFragments: UInt16) {
+        self.frameID = frameID
+        self.fragmentID = fragmentID
+        self.totalFragments = totalFragments
+    }
+    
+    public func serialize() -> Data {
+        var data = Data(capacity: 8)
+        var fID = frameID.bigEndian
+        var fragID = fragmentID.bigEndian
+        var totalFrags = totalFragments.bigEndian
+        
+        withUnsafeBytes(of: &fID) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &fragID) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &totalFrags) { data.append(contentsOf: $0) }
+        return data
+    }
+    
+    public static func parse(from data: Data) -> (header: UDPVideoDatagramHeader, payload: Data)? {
+        guard data.count >= 8 else { return nil }
+        
+        let fIDRaw = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }
+        let fragIDRaw = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt16.self) }
+        let totalFragsRaw = data.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 6, as: UInt16.self) }
+        
+        let header = UDPVideoDatagramHeader(
+            frameID: UInt32(bigEndian: fIDRaw),
+            fragmentID: UInt16(bigEndian: fragIDRaw),
+            totalFragments: UInt16(bigEndian: totalFragsRaw)
+        )
+        
+        let payload = data.subdata(in: 8..<data.count)
+        return (header, payload)
+    }
+}
+
 // MARK: - NWProtocolFramer Implementation for TLV (5-byte Header)
 
 public final class TailRemoteFramer: NWProtocolFramerImplementation {

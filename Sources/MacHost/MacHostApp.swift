@@ -18,6 +18,7 @@ public final class MacHostServerState: ObservableObject {
     @Published public var isRunning: Bool = false
     @Published public var localHostName: String = "Quintessa.local"
     @Published public var port: UInt16 = 8088
+    @Published public var udpPort: UInt16 = 8089
     @Published public var sessionPIN: String = "0000"
     
     private var server: MacHostServer?
@@ -42,14 +43,13 @@ public final class MacHostServerState: ObservableObject {
             logPrint("✅ Accessibility Permission: GRANTED (Remote input control enabled)")
         }
         
-        // Regenerate PIN on fresh server start
         self.sessionPIN = String(format: "%04d", Int.random(in: 0...9999))
-        let newServer = MacHostServer(port: port, sessionPIN: sessionPIN)
+        let newServer = MacHostServer(port: port, udpPort: udpPort, sessionPIN: sessionPIN)
         do {
             try newServer.start()
             self.server = newServer
             self.isRunning = true
-            logPrint("🟢 MacHost Gatekeeper Listener READY on port \(port) [Session PIN: \(sessionPIN)] (Waiting for client auth...)")
+            logPrint("🟢 MacHost Dual Listener READY (TCP: \(port), UDP Video: \(udpPort)) [PIN: \(sessionPIN)]")
         } catch {
             logPrint("❌ Server Startup Error: \(error)")
             self.isRunning = false
@@ -61,7 +61,7 @@ public final class MacHostServerState: ObservableObject {
         server?.stop()
         server = nil
         isRunning = false
-        logPrint("🛑 MacHost Listener STOPPED on port \(port)")
+        logPrint("🛑 MacHost Listener STOPPED on ports \(port) & \(udpPort)")
     }
     
     public func toggleServer() {
@@ -95,23 +95,27 @@ struct TailRemoteHostApp: App {
     }
 }
 
-// MARK: - Mac Host TCP Listener Server
+// MARK: - Mac Host Hybrid TCP + UDP Listener Server
 
 public final class MacHostServer: @unchecked Sendable {
     private let port: UInt16
+    private let udpPort: UInt16
     public let sessionPIN: String
     private var listener: NWListener?
+    private var udpListener: NWListener?
     private var activeSession: MacHostSession?
     
     public var blockedIPs = Set<String>()
     public var failedAttempts: [String: Int] = [:]
     
-    public init(port: UInt16 = 8088, sessionPIN: String) {
+    public init(port: UInt16 = 8088, udpPort: UInt16 = 8089, sessionPIN: String) {
         self.port = port
+        self.udpPort = udpPort
         self.sessionPIN = sessionPIN
     }
     
     public func start() throws {
+        // 1. TCP Control/Input Listener (Port 8088)
         let tcpOptions = NWProtocolTCP.Options()
         tcpOptions.noDelay = true
         let parameters = NWParameters(tls: nil, tcp: tcpOptions)
@@ -125,8 +129,18 @@ public final class MacHostServer: @unchecked Sendable {
         nwListener.newConnectionHandler = { [weak self] connection in
             self?.handleConnection(connection)
         }
-        
         nwListener.start(queue: .global(qos: .userInteractive))
+        
+        // 2. UDP Video Datagram Listener (Port 8089)
+        let udpParameters = NWParameters.udp
+        let nwUDPListener = try NWListener(using: udpParameters, on: NWEndpoint.Port(rawValue: udpPort)!)
+        self.udpListener = nwUDPListener
+        
+        nwUDPListener.newConnectionHandler = { [weak self] connection in
+            logPrint("📡 MacHost: Incoming UDP video connection from \(connection.endpoint)")
+            self?.activeSession?.assignUDPConnection(connection)
+        }
+        nwUDPListener.start(queue: .global(qos: .userInteractive))
     }
     
     public func stop() {
@@ -134,6 +148,8 @@ public final class MacHostServer: @unchecked Sendable {
         activeSession = nil
         listener?.cancel()
         listener = nil
+        udpListener?.cancel()
+        udpListener = nil
     }
     
     private func handleConnection(_ connection: NWConnection) {
@@ -145,7 +161,7 @@ public final class MacHostServer: @unchecked Sendable {
             return
         }
         
-        logPrint("📩 Incoming connection from iPhone (\(connection.endpoint)). Initializing Gatekeeper authentication...")
+        logPrint("📩 Incoming TCP connection from iPhone (\(connection.endpoint)). Initializing Gatekeeper authentication...")
         activeSession?.stop()
         let session = MacHostSession(connection: connection, expectedPIN: sessionPIN, server: self, clientIP: clientIP)
         self.activeSession = session
@@ -176,6 +192,7 @@ public final class MacHostSession: @unchecked Sendable {
     }
     
     private let connection: NWConnection
+    private var udpConnection: NWConnection?
     private let expectedPIN: String
     private unowned let server: MacHostServer
     private let clientIP: String
@@ -189,6 +206,12 @@ public final class MacHostSession: @unchecked Sendable {
         self.expectedPIN = expectedPIN
         self.server = server
         self.clientIP = clientIP
+    }
+    
+    public func assignUDPConnection(_ udpConnection: NWConnection) {
+        self.udpConnection = udpConnection
+        videoPipeline?.updateUDPConnection(udpConnection)
+        udpConnection.start(queue: .global(qos: .userInteractive))
     }
     
     public func start() {
@@ -214,16 +237,18 @@ public final class MacHostSession: @unchecked Sendable {
     public func stop() {
         stopCapturePipeline()
         connection.cancel()
+        udpConnection?.cancel()
+        udpConnection = nil
     }
     
     private func startCapturePipeline() {
-        let pipeline = MacHostVideoPipeline(connection: connection)
+        let pipeline = MacHostVideoPipeline(connection: udpConnection)
         self.videoPipeline = pipeline
         
         Task {
             do {
                 try await pipeline.startCapture()
-                logPrint("🎥 MacHost: ScreenCaptureKit video pipeline started @ 60 FPS for Authenticated Session")
+                logPrint("🎥 MacHost: ScreenCaptureKit video pipeline started @ 60 FPS over UDP Transport")
             } catch {
                 logPrint("❌ MacHost: Video pipeline start failed: \(error)")
             }
@@ -277,7 +302,7 @@ public final class MacHostSession: @unchecked Sendable {
             case .keyboardCommand:
                 handleKeyboardCommand(payload: payload)
             case .authPIN:
-                logPrint("ℹ️ MacHost: Session already authenticated.")
+                logPrint("ℹ️ MacHost: Session authenticated.")
             case .videoFrame:
                 break
             }
@@ -292,17 +317,13 @@ public final class MacHostSession: @unchecked Sendable {
             state = .authenticated
             server.failedAttempts[clientIP] = 0
             
-            // Send Auth Success response payload [0x01]
             sendTLV(type: .authPIN, payload: Data([0x01]))
-            
-            // Spin up real-time screen capture pipeline
             startCapturePipeline()
         } else {
             let attempts = (server.failedAttempts[clientIP] ?? 0) + 1
             server.failedAttempts[clientIP] = attempts
             logPrint("⚠️ MacHost Gatekeeper: AUTHENTICATION FAILED for client \(clientIP) (Attempt \(attempts)/3, Provided: '\(receivedPIN)').")
             
-            // Send Auth Fail response payload [0x00]
             sendTLV(type: .authPIN, payload: Data([0x00]))
             
             if attempts >= 3 {
@@ -318,7 +339,7 @@ public final class MacHostSession: @unchecked Sendable {
         let subType = payload[0]
         
         switch subType {
-        case 0x01: // Relative Move: dx (Float), dy (Float)
+        case 0x01:
             guard payload.count >= 9 else { return }
             let dxRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self) }
             let dyRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: UInt32.self) }
@@ -326,23 +347,23 @@ public final class MacHostSession: @unchecked Sendable {
             let dy = Float(bitPattern: UInt32(bigEndian: dyRaw))
             MacInputInjector.injectRelativeMove(dx: dx, dy: dy)
             
-        case 0x02: // Absolute Move: normX (Float), normY (Float)
+        case 0x02:
             guard payload.count >= 9 else { return }
             let xRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self) }
-            let yRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: UInt32.self) }
+            let yRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self) }
             let normX = Float(bitPattern: UInt32(bigEndian: xRaw))
             let normY = Float(bitPattern: UInt32(bigEndian: yRaw))
             let mainBounds = CGDisplayBounds(CGMainDisplayID())
             MacInputInjector.injectAbsoluteMove(normalizedX: normX, normalizedY: normY, screenWidth: mainBounds.width, screenHeight: mainBounds.height)
             
-        case 0x03: // Mouse Button: button (UInt8), state (UInt8)
+        case 0x03:
             guard payload.count >= 3 else { return }
             if let button = MouseButtonType(rawValue: payload[1]),
                let state = MouseButtonState(rawValue: payload[2]) {
                 MacInputInjector.injectMouseButton(button: button, state: state)
             }
             
-        case 0x04: // Scroll: scrollDx (Float), scrollDy (Float)
+        case 0x04:
             guard payload.count >= 9 else { return }
             let dxRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self) }
             let dyRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: UInt32.self) }
