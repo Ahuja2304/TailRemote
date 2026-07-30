@@ -184,9 +184,15 @@ public class TrackpadUIView: UIView {
     @objc private func handleMovePan(_ sender: UIPanGestureRecognizer) {
         onUserInteraction?()
         let location = sender.location(in: self)
+        let translation = sender.translation(in: self)
+        sender.setTranslation(.zero, in: self)
         
         // 1. Immediate 120Hz Local Cursor Update on Main Thread (Zero Latency)
-        onLocalCursorMove?(location)
+        if mode == .trackpadRelative {
+            onLocalCursorMove?(translation)
+        } else {
+            onLocalCursorMove?(location)
+        }
         
         // Handle gesture end / cancel cleanly
         if sender.state == .ended || sender.state == .cancelled {
@@ -202,9 +208,7 @@ public class TrackpadUIView: UIView {
         lastDispatchTime = now
         
         let currentMode = mode
-        let translation = sender.translation(in: self)
         let boundsSize = bounds
-        sender.setTranslation(.zero, in: self)
         
         // Phase 1 & 4: Dispatch TCP network call off Main Thread to background queue + High-precision Telemetry
         DispatchQueue.global(qos: .userInteractive).async { [weak self] in

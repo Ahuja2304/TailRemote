@@ -226,7 +226,7 @@ public final class ImmersiveWorkspaceState {
 
 public struct iPhoneClientWorkspaceView: View {
     @State private var state = ImmersiveWorkspaceState()
-    @State private var localCursorPosition: CGPoint = CGPoint(x: 200, y: 200)
+    @State private var localCursorPosition: CGPoint = CGPoint(x: 400, y: 200)
     
     public let displayLayer: AVSampleBufferDisplayLayer
     public var isAuthenticated: Bool = false
@@ -276,9 +276,11 @@ public struct iPhoneClientWorkspaceView: View {
             TailRemoteGestureView(
                 mode: state.inputMode,
                 onLocalCursorMove: { point in
+                    let screenSize = UIScreen.main.bounds.size
                     if state.inputMode == .trackpadRelative {
-                        localCursorPosition.x += point.x
-                        localCursorPosition.y += point.y
+                        let newX = max(0, min(screenSize.width, localCursorPosition.x + point.x))
+                        let newY = max(0, min(screenSize.height, localCursorPosition.y + point.y))
+                        localCursorPosition = CGPoint(x: newX, y: newY)
                     } else {
                         localCursorPosition = point
                     }
@@ -297,11 +299,12 @@ public struct iPhoneClientWorkspaceView: View {
             // Phase 2: Local Cursor Rendering Overlay (Zero Perceived Latency @ 120Hz)
             if isAuthenticated {
                 Image(systemName: "cursorarrow")
-                    .font(.system(size: 20, weight: .bold))
+                    .font(.system(size: 24, weight: .bold))
                     .foregroundColor(.white)
-                    .shadow(color: .black.opacity(0.8), radius: 3, x: 1, y: 2)
+                    .shadow(color: .black, radius: 2, x: 1, y: 1)
                     .position(localCursorPosition)
                     .allowsHitTesting(false)
+                    .zIndex(100)
             }
             
             // Native UIKeyInput Keystroke Catcher
