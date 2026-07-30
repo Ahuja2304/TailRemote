@@ -21,6 +21,8 @@
 		F1000011 /* MacHostApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000011 /* MacHostApp.swift */; };
 		F1000012 /* InputTranslator.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000004 /* InputTranslator.swift */; };
 		F1000014 /* AdaptiveRateController.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000014 /* AdaptiveRateController.swift */; };
+		F1000015 /* TailRemoteMenuBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000015 /* TailRemoteMenuBarView.swift */; };
+		F1000016 /* PowerManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = F2000016 /* PowerManager.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -36,6 +38,8 @@
 		F2000010 /* FileBroker.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBroker.swift; sourceTree = "<group>"; };
 		F2000011 /* MacHostApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MacHostApp.swift; sourceTree = "<group>"; };
 		F2000014 /* AdaptiveRateController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AdaptiveRateController.swift; sourceTree = "<group>"; };
+		F2000015 /* TailRemoteMenuBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TailRemoteMenuBarView.swift; sourceTree = "<group>"; };
+		F2000016 /* PowerManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PowerManager.swift; sourceTree = "<group>"; };
 		F3000001 /* TailRemoteiOS.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = TailRemoteiOS.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		F3000002 /* MacHost */ = {isa = PBXFileReference; explicitFileType = "compiled.mach-o.executable"; includeInIndex = 0; path = MacHost; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -89,6 +93,8 @@
 			isa = PBXGroup;
 			children = (
 				F2000011 /* MacHostApp.swift */,
+				F2000015 /* TailRemoteMenuBarView.swift */,
+				F2000016 /* PowerManager.swift */,
 			);
 			path = Sources/MacHost;
 			sourceTree = "<group>";
@@ -208,6 +214,8 @@
 				F1000011 /* MacHostApp.swift in Sources */,
 				F1000012 /* InputTranslator.swift in Sources */,
 				F1000014 /* AdaptiveRateController.swift in Sources */,
+				F1000015 /* TailRemoteMenuBarView.swift in Sources */,
+				F1000016 /* PowerManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
