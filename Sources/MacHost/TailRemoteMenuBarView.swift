@@ -28,6 +28,32 @@ public struct TailRemoteMenuBarView: View {
             }
             .padding(.top, 2)
 
+            // Gatekeeper Session PIN Badge
+            if serverState.isRunning {
+                VStack(spacing: 6) {
+                    Text("GATEKEEPER AUTHENTICATION PIN")
+                        .font(.caption2)
+                        .fontWeight(.bold)
+                        .foregroundColor(.secondary)
+                    
+                    HStack(spacing: 12) {
+                        ForEach(Array(serverState.sessionPIN.enumerated()), id: \.offset) { _, char in
+                            Text(String(char))
+                                .font(.system(size: 22, weight: .bold, design: .monospaced))
+                                .foregroundColor(.white)
+                                .frame(width: 36, height: 42)
+                                .background(Color.blue)
+                                .cornerRadius(8)
+                                .shadow(radius: 2)
+                        }
+                    }
+                }
+                .padding(10)
+                .frame(maxWidth: .infinity)
+                .background(Color.blue.opacity(0.1))
+                .cornerRadius(10)
+            }
+
             Divider()
 
             // Main Server Toggle Button
@@ -87,6 +113,6 @@ public struct TailRemoteMenuBarView: View {
             .keyboardShortcut("q")
         }
         .padding(14)
-        .frame(width: 260)
+        .frame(width: 270)
     }
 }

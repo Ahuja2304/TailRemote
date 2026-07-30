@@ -199,10 +199,11 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         guard blockBufferStatus == noErr, let rawDataPointer = dataPointer, totalLength > 0 else { return }
         
         let rawBuffer = UnsafeRawBufferPointer(start: rawDataPointer, count: totalLength)
-        let dispatchData = DispatchData(bytes: rawBuffer)
+        let subType: UInt8 = isKeyframe ? 0x02 : 0x03
+        var payload = Data([subType])
+        payload.append(contentsOf: rawBuffer)
         
-        let messageType: TailRemoteMessageType = isKeyframe ? .keyframe : .pFrame
-        sendVideoPacket(data: dispatchData, messageType: messageType)
+        sendVideoPacket(payload: payload)
         
         // Fix 3: Host Pipeline Throttle Logging (Once every 60 frames)
         encodedFrameCount += 1
@@ -240,7 +241,7 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         
         guard let sps = spsHeader, let pps = ppsHeader else { return }
         
-        var payload = Data()
+        var payload = Data([0x01]) // Sub-type 0x01: Format Description
         
         let spsSizeUInt16 = UInt16(spsSize).bigEndian
         withUnsafeBytes(of: spsSizeUInt16) { payload.append(contentsOf: $0) }
@@ -250,20 +251,20 @@ public final class MacHostVideoPipeline: NSObject, @unchecked Sendable {
         withUnsafeBytes(of: ppsSizeUInt16) { payload.append(contentsOf: $0) }
         payload.append(pps, count: ppsSize)
         
-        payload.withUnsafeBytes { rawBuffer in
-            let dispatchData = DispatchData(bytes: rawBuffer)
-            sendVideoPacket(data: dispatchData, messageType: .formatDescription)
-            logPrint("🎥 MacHostVideoPipeline: Transmitted SPS/PPS Format Description (\(spsSize) SPS bytes, \(ppsSize) PPS bytes)")
-        }
+        sendVideoPacket(payload: payload)
+        logPrint("🎥 MacHostVideoPipeline: Transmitted SPS/PPS Format Description (\(spsSize) SPS bytes, \(ppsSize) PPS bytes)")
     }
     
-    private func sendVideoPacket(data: DispatchData, messageType: TailRemoteMessageType) {
+    private func sendVideoPacket(payload: Data) {
         guard let connection = connection else { return }
         
-        let message = NWProtocolFramer.Message(channel: .video, messageType: messageType)
+        let message = NWProtocolFramer.Message(type: .videoFrame)
         let context = NWConnection.ContentContext(identifier: "VideoPacket", metadata: [message])
         
-        connection.send(content: data, contentContext: context, isComplete: true, completion: .idempotent)
+        payload.withUnsafeBytes { rawBuffer in
+            let dispatchData = DispatchData(bytes: rawBuffer)
+            connection.send(content: dispatchData, contentContext: context, isComplete: true, completion: .idempotent)
+        }
     }
 }
 

@@ -18,6 +18,7 @@ public final class MacHostServerState: ObservableObject {
     @Published public var isRunning: Bool = false
     @Published public var localHostName: String = "Quintessa.local"
     @Published public var port: UInt16 = 8088
+    @Published public var sessionPIN: String = "0000"
     
     private var server: MacHostServer?
     
@@ -26,6 +27,7 @@ public final class MacHostServerState: ObservableObject {
         if let hostName = Host.current().localizedName, !hostName.isEmpty {
             self.localHostName = hostName
         }
+        self.sessionPIN = String(format: "%04d", Int.random(in: 0...9999))
         startServer()
     }
     
@@ -40,12 +42,14 @@ public final class MacHostServerState: ObservableObject {
             logPrint("✅ Accessibility Permission: GRANTED (Remote input control enabled)")
         }
         
-        let newServer = MacHostServer(port: port)
+        // Regenerate PIN on fresh server start
+        self.sessionPIN = String(format: "%04d", Int.random(in: 0...9999))
+        let newServer = MacHostServer(port: port, sessionPIN: sessionPIN)
         do {
             try newServer.start()
             self.server = newServer
             self.isRunning = true
-            logPrint("🟢 MacHost Listener READY on port \(port) (Waiting for iPhone connection...)")
+            logPrint("🟢 MacHost Gatekeeper Listener READY on port \(port) [Session PIN: \(sessionPIN)] (Waiting for client auth...)")
         } catch {
             logPrint("❌ Server Startup Error: \(error)")
             self.isRunning = false
@@ -73,7 +77,6 @@ public final class MacHostServerState: ObservableObject {
 
 public final class MacHostAppDelegate: NSObject, NSApplicationDelegate {
     public func applicationDidFinishLaunching(_ notification: Notification) {
-        // Enforce macOS Menu Bar Accessory Activation Policy (hides Dock icon & pins to Menu Bar)
         NSApp.setActivationPolicy(.accessory)
         logPrint("🟢 MacHost: Set NSApp activation policy to .accessory (Menu Bar Agent)")
     }
@@ -96,11 +99,16 @@ struct TailRemoteHostApp: App {
 
 public final class MacHostServer: @unchecked Sendable {
     private let port: UInt16
+    public let sessionPIN: String
     private var listener: NWListener?
     private var activeSession: MacHostSession?
     
-    public init(port: UInt16 = 8088) {
+    public var blockedIPs = Set<String>()
+    public var failedAttempts: [String: Int] = [:]
+    
+    public init(port: UInt16 = 8088, sessionPIN: String) {
         self.port = port
+        self.sessionPIN = sessionPIN
     }
     
     public func start() throws {
@@ -115,7 +123,6 @@ public final class MacHostServer: @unchecked Sendable {
         self.listener = nwListener
         
         nwListener.newConnectionHandler = { [weak self] connection in
-            logPrint("📩 Incoming TCP connection from iPhone (\(connection.endpoint))...")
             self?.handleConnection(connection)
         }
         
@@ -130,30 +137,65 @@ public final class MacHostServer: @unchecked Sendable {
     }
     
     private func handleConnection(_ connection: NWConnection) {
+        let clientIP = extractIPAddress(from: connection.endpoint)
+        
+        if blockedIPs.contains(clientIP) {
+            logPrint("🚫 MacHost Gatekeeper: Blocked unauthorized connection attempt from IP \(clientIP)")
+            connection.cancel()
+            return
+        }
+        
+        logPrint("📩 Incoming connection from iPhone (\(connection.endpoint)). Initializing Gatekeeper authentication...")
         activeSession?.stop()
-        let session = MacHostSession(connection: connection)
+        let session = MacHostSession(connection: connection, expectedPIN: sessionPIN, server: self, clientIP: clientIP)
         self.activeSession = session
         session.start()
     }
+    
+    private func extractIPAddress(from endpoint: NWEndpoint) -> String {
+        switch endpoint {
+        case .hostPort(let host, _):
+            switch host {
+            case .name(let name, _): return name
+            case .ipv4(let address): return "\(address)"
+            case .ipv6(let address): return "\(address)"
+            @unknown default: return "unknown"
+            }
+        default:
+            return "unknown"
+        }
+    }
 }
 
-// MARK: - Mac Host Active Session Pipeline
+// MARK: - Mac Host Active Session & Gatekeeper State Machine
 
 public final class MacHostSession: @unchecked Sendable {
+    public enum SessionAuthState {
+        case waitingForAuth
+        case authenticated
+    }
+    
     private let connection: NWConnection
+    private let expectedPIN: String
+    private unowned let server: MacHostServer
+    private let clientIP: String
+    
+    private var state: SessionAuthState = .waitingForAuth
     private var videoPipeline: MacHostVideoPipeline?
     private let fileBroker = FileBroker()
     
-    public init(connection: NWConnection) {
+    public init(connection: NWConnection, expectedPIN: String, server: MacHostServer, clientIP: String) {
         self.connection = connection
+        self.expectedPIN = expectedPIN
+        self.server = server
+        self.clientIP = clientIP
     }
     
     public func start() {
-        connection.stateUpdateHandler = { [weak self] state in
-            switch state {
+        connection.stateUpdateHandler = { [weak self] connectionState in
+            switch connectionState {
             case .ready:
-                logPrint("✅ MacHost: Client connected successfully from \(self?.connection.endpoint.debugDescription ?? "unknown")")
-                self?.startCapturePipeline()
+                logPrint("✅ MacHost: Client TCP socket connected (\(self?.clientIP ?? "unknown")). Awaiting 4-digit PIN Auth payload...")
                 self?.receiveNextPacket()
             case .failed(let error):
                 logPrint("❌ MacHost: Connection failed: \(error)")
@@ -161,8 +203,6 @@ public final class MacHostSession: @unchecked Sendable {
             case .cancelled:
                 logPrint("ℹ️ MacHost: Connection cancelled")
                 self?.stopCapturePipeline()
-            case .preparing:
-                logPrint("🔄 MacHost: Connection state changed to preparing")
             default:
                 break
             }
@@ -183,7 +223,7 @@ public final class MacHostSession: @unchecked Sendable {
         Task {
             do {
                 try await pipeline.startCapture()
-                logPrint("🎥 MacHost: ScreenCaptureKit video pipeline started @ 60 FPS")
+                logPrint("🎥 MacHost: ScreenCaptureKit video pipeline started @ 60 FPS for Authenticated Session")
             } catch {
                 logPrint("❌ MacHost: Video pipeline start failed: \(error)")
             }
@@ -197,117 +237,133 @@ public final class MacHostSession: @unchecked Sendable {
         }
     }
     
-    // MARK: - Packet Receiver Loop
+    // MARK: - Recursive TLV Packet Receiver Loop
     
     private func receiveNextPacket() {
         connection.receiveMessage { [weak self] content, context, isComplete, error in
             guard let self = self else { return }
             
             if let error = error {
-                logPrint("⚠️ MacHost: Packet receive error: \(error)")
+                logPrint("⚠️ MacHost: TLV packet receive error: \(error)")
                 return
             }
             
             if let framerMessage = context?.protocolMetadata(definition: TailRemoteFramer.definition) as? NWProtocolFramer.Message,
-               let channelID = framerMessage.channelID,
-               let messageType = framerMessage.messageType {
+               let msgTypeRaw = framerMessage.messageType,
+               let msgType = TailRemoteMessageType(rawValue: msgTypeRaw) {
                 
-                self.processInboundPacket(channelID: channelID, messageType: messageType, payload: content ?? Data())
+                self.processInboundTLV(type: msgType, payload: content ?? Data())
             }
             
             self.receiveNextPacket()
         }
     }
     
-    private func processInboundPacket(channelID: UInt8, messageType: UInt8, payload: Data) {
-        guard let channel = TailRemoteChannel(rawValue: channelID),
-              let msgType = TailRemoteMessageType(rawValue: messageType) else { return }
-        
-        switch channel {
-        case .controlAndHandshake:
-            if msgType == .requestIDR {
-                logPrint("⚡️ MacHost: Received RequestIDR Keyframe request from iPhone. Forcing keyframe...")
-                videoPipeline?.forceKeyframe()
+    // MARK: - Inbound TLV Payload Processing & Gatekeeper Enforcement
+    
+    private func processInboundTLV(type: TailRemoteMessageType, payload: Data) {
+        switch state {
+        case .waitingForAuth:
+            if type == .authPIN {
+                handleAuthenticationAttempt(payload: payload)
+            } else {
+                logPrint("⚠️ MacHost Gatekeeper: Dropped unauthenticated packet (Type 0x\(String(type.rawValue, radix: 16))) from \(clientIP)")
             }
-        case .input:
-            handleInputEvent(messageType: msgType, payload: payload)
-        case .fileTransfer:
-            if msgType == .fileDirectoryListReq {
-                handleDirectoryListRequest(payload: payload)
+            
+        case .authenticated:
+            switch type {
+            case .mouseInput:
+                handleMouseInput(payload: payload)
+            case .keyboardCommand:
+                handleKeyboardCommand(payload: payload)
+            case .authPIN:
+                logPrint("ℹ️ MacHost: Session already authenticated.")
+            case .videoFrame:
+                break
             }
-        default:
-            break
         }
     }
     
-    private func handleInputEvent(messageType: TailRemoteMessageType, payload: Data) {
-        switch messageType {
-        case .pointerMoveRelative:
-            guard payload.count >= 8 else { return }
-            let dxRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }
-            let dyRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self) }
+    private func handleAuthenticationAttempt(payload: Data) {
+        let receivedPIN = String(data: payload, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        
+        if receivedPIN == expectedPIN {
+            logPrint("🔓 MacHost Gatekeeper: AUTHENTICATION SUCCESSFUL for client \(clientIP) with PIN '\(receivedPIN)'.")
+            state = .authenticated
+            server.failedAttempts[clientIP] = 0
+            
+            // Send Auth Success response payload [0x01]
+            sendTLV(type: .authPIN, payload: Data([0x01]))
+            
+            // Spin up real-time screen capture pipeline
+            startCapturePipeline()
+        } else {
+            let attempts = (server.failedAttempts[clientIP] ?? 0) + 1
+            server.failedAttempts[clientIP] = attempts
+            logPrint("⚠️ MacHost Gatekeeper: AUTHENTICATION FAILED for client \(clientIP) (Attempt \(attempts)/3, Provided: '\(receivedPIN)').")
+            
+            // Send Auth Fail response payload [0x00]
+            sendTLV(type: .authPIN, payload: Data([0x00]))
+            
+            if attempts >= 3 {
+                logPrint("🚫 MacHost Gatekeeper: Brute-Force limit reached for IP \(clientIP). Blocking IP and terminating TCP connection.")
+                server.blockedIPs.insert(clientIP)
+                connection.cancel()
+            }
+        }
+    }
+    
+    private func handleMouseInput(payload: Data) {
+        guard payload.count >= 1 else { return }
+        let subType = payload[0]
+        
+        switch subType {
+        case 0x01: // Relative Move: dx (Float), dy (Float)
+            guard payload.count >= 9 else { return }
+            let dxRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self) }
+            let dyRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: UInt32.self) }
             let dx = Float(bitPattern: UInt32(bigEndian: dxRaw))
             let dy = Float(bitPattern: UInt32(bigEndian: dyRaw))
             MacInputInjector.injectRelativeMove(dx: dx, dy: dy)
-            logPrint("🖱️ MacHost: Injected relative mouse move (dx: \(dx), dy: \(dy))")
             
-        case .pointerMoveAbsolute:
-            guard payload.count >= 8 else { return }
-            let xRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }
-            let yRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self) }
+        case 0x02: // Absolute Move: normX (Float), normY (Float)
+            guard payload.count >= 9 else { return }
+            let xRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self) }
+            let yRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: UInt32.self) }
             let normX = Float(bitPattern: UInt32(bigEndian: xRaw))
             let normY = Float(bitPattern: UInt32(bigEndian: yRaw))
+            let mainBounds = CGDisplayBounds(CGMainDisplayID())
+            MacInputInjector.injectAbsoluteMove(normalizedX: normX, normalizedY: normY, screenWidth: mainBounds.width, screenHeight: mainBounds.height)
             
-            let mainDisplayBounds = CGDisplayBounds(CGMainDisplayID())
-            MacInputInjector.injectAbsoluteMove(normalizedX: normX, normalizedY: normY, screenWidth: mainDisplayBounds.width, screenHeight: mainDisplayBounds.height)
-            logPrint("🎯 MacHost: Injected absolute mouse move (x: \(normX), y: \(normY))")
-            
-        case .mouseButton:
-            guard payload.count >= 2 else { return }
-            let buttonRaw = payload[0]
-            let stateRaw = payload[1]
-            if let button = MouseButtonType(rawValue: buttonRaw),
-               let state = MouseButtonState(rawValue: stateRaw) {
+        case 0x03: // Mouse Button: button (UInt8), state (UInt8)
+            guard payload.count >= 3 else { return }
+            if let button = MouseButtonType(rawValue: payload[1]),
+               let state = MouseButtonState(rawValue: payload[2]) {
                 MacInputInjector.injectMouseButton(button: button, state: state)
-                logPrint("🖱️ MacHost: Injected mouse button click (\(button) - \(state))")
             }
             
-        case .scrollEvent:
-            guard payload.count >= 8 else { return }
-            let dxRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 0, as: UInt32.self) }
-            let dyRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 4, as: UInt32.self) }
+        case 0x04: // Scroll: scrollDx (Float), scrollDy (Float)
+            guard payload.count >= 9 else { return }
+            let dxRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 1, as: UInt32.self) }
+            let dyRaw = payload.withUnsafeBytes { $0.loadUnaligned(fromByteOffset: 5, as: UInt32.self) }
             let scrollDx = Float(bitPattern: UInt32(bigEndian: dxRaw))
             let scrollDy = Float(bitPattern: UInt32(bigEndian: dyRaw))
             MacInputInjector.injectScroll(scrollDx: scrollDx, scrollDy: scrollDy)
-            logPrint("📜 MacHost: Injected scroll event (dx: \(scrollDx), dy: \(scrollDy))")
-            
-        case .keyStroke:
-            if let charStr = String(data: payload, encoding: .utf8) {
-                MacInputInjector.injectKeystroke(charStr)
-                logPrint("⌨️ MacHost: Injected keystroke '\(charStr)' to macOS system")
-            }
             
         default:
             break
         }
     }
     
-    private func handleDirectoryListRequest(payload: Data) {
-        let requestedPath = String(data: payload, encoding: .utf8) ?? "~/"
-        let expandedPath = NSString(string: requestedPath).expandingTildeInPath
-        let url = URL(fileURLWithPath: expandedPath)
-        Task {
-            if let files = try? await fileBroker.listDirectory(at: url),
-               let responseData = try? JSONEncoder().encode(files) {
-                sendPacket(channel: .fileTransfer, messageType: .fileDirectoryListResp, payload: responseData)
-                logPrint("📁 MacHost: Sent directory list (\(files.count) items) for path '\(requestedPath)'")
-            }
+    private func handleKeyboardCommand(payload: Data) {
+        if let charStr = String(data: payload, encoding: .utf8) {
+            MacInputInjector.injectKeystroke(charStr)
         }
     }
     
-    private func sendPacket(channel: TailRemoteChannel, messageType: TailRemoteMessageType, payload: Data) {
-        let message = NWProtocolFramer.Message(channel: channel, messageType: messageType)
-        let context = NWConnection.ContentContext(identifier: "HostPacket", metadata: [message])
+    private func sendTLV(type: TailRemoteMessageType, payload: Data) {
+        let message = NWProtocolFramer.Message(type: type)
+        let context = NWConnection.ContentContext(identifier: "HostTLV", metadata: [message])
         
         payload.withUnsafeBytes { rawBuffer in
             let dispatchData = DispatchData(bytes: rawBuffer)

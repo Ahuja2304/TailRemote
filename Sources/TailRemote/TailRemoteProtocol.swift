@@ -1,43 +1,29 @@
 import Foundation
 import Network
 
-// MARK: - TailRemote Protocol Channel & Message Specifications
-
-@frozen
-public enum TailRemoteChannel: UInt8, Sendable {
-    case controlAndHandshake = 0x00
-    case input                = 0x01
-    case video                = 0x02
-    case fileTransfer         = 0x03
-}
+// MARK: - TailRemote TLV Protocol Definition (Phase 1)
 
 @frozen
 public enum TailRemoteMessageType: UInt8, Sendable {
-    // Channel 0: Control & Handshake
-    case requestIDR            = 0x01
-    case codecConfiguration    = 0x02
-    case systemCommand         = 0x04
-    
-    // Channel 1: Input Events
-    case pointerMoveRelative   = 0x10
-    case pointerMoveAbsolute   = 0x11
-    case mouseButton           = 0x12
-    case scrollEvent           = 0x13
-    case keyStroke             = 0x14
-    
-    // Channel 2: Video Stream
-    case formatDescription     = 0x20
-    case keyframe              = 0x21
-    case pFrame                = 0x22
-    
-    // Channel 3: File Transfer
-    case fileDirectoryListReq  = 0x30
-    case fileDirectoryListResp = 0x31
-    case fileChunkHeader       = 0x32
-    case fileChunkPayload      = 0x33
+    case authPIN          = 0x01
+    case videoFrame       = 0x02
+    case mouseInput       = 0x03
+    case keyboardCommand  = 0x04
 }
 
-// MARK: - Protocol Framer Implementation (6-byte Big-Endian Header)
+// MARK: - TLV Header Structure: Byte 0 (Type) + Bytes 1-4 (UInt32 BE Length)
+
+public struct TailRemoteHeader {
+    public let messageType: UInt8
+    public let payloadLength: UInt32
+    
+    public init(messageType: UInt8, payloadLength: UInt32) {
+        self.messageType = messageType
+        self.payloadLength = payloadLength
+    }
+}
+
+// MARK: - NWProtocolFramer Implementation for TLV (5-byte Header)
 
 public final class TailRemoteFramer: NWProtocolFramerImplementation {
     public static let label = "TailRemoteProtocol"
@@ -51,38 +37,32 @@ public final class TailRemoteFramer: NWProtocolFramerImplementation {
     
     public func handleInput(framer: NWProtocolFramer.Instance) -> Int {
         while true {
-            var header: TailRemoteHeader? = nil
+            var typeRaw: UInt8 = 0
+            var payloadLength: UInt32 = 0
             
-            // Fix: Use parseInput inside handleInput (NOT parseOutput)
-            let parsed = framer.parseInput(minimumIncompleteLength: 6, maximumLength: 6) { buffer, _ in
-                guard let buffer = buffer, buffer.count >= 6 else { return 0 }
+            let parsed = framer.parseInput(minimumIncompleteLength: 5, maximumLength: 5) { buffer, _ in
+                guard let buffer = buffer, buffer.count >= 5 else { return 0 }
                 
-                let channelID = buffer.loadUnaligned(fromByteOffset: 0, as: UInt8.self)
-                let messageType = buffer.loadUnaligned(fromByteOffset: 1, as: UInt8.self)
-                let payloadLengthRaw = buffer.loadUnaligned(fromByteOffset: 2, as: UInt32.self)
-                let payloadLength = UInt32(bigEndian: payloadLengthRaw)
-                
-                header = TailRemoteHeader(channelID: channelID, messageType: messageType, payloadLength: payloadLength)
-                return 6
+                typeRaw = buffer.loadUnaligned(fromByteOffset: 0, as: UInt8.self)
+                let lengthRaw = buffer.loadUnaligned(fromByteOffset: 1, as: UInt32.self)
+                payloadLength = UInt32(bigEndian: lengthRaw)
+                return 5
             }
             
-            guard parsed, let header = header else { return 6 }
+            guard parsed else { return 5 }
             
-            let message = NWProtocolFramer.Message(channel: TailRemoteChannel(rawValue: header.channelID) ?? .controlAndHandshake,
-                                                   messageType: TailRemoteMessageType(rawValue: header.messageType) ?? .requestIDR)
+            let message = NWProtocolFramer.Message(type: TailRemoteMessageType(rawValue: typeRaw) ?? .authPIN)
             
-            if !framer.deliverInputNoCopy(length: Int(header.payloadLength), message: message, isComplete: true) {
-                return Int(header.payloadLength)
+            if !framer.deliverInputNoCopy(length: Int(payloadLength), message: message, isComplete: true) {
+                return Int(payloadLength)
             }
         }
     }
     
     public func handleOutput(framer: NWProtocolFramer.Instance, message: NWProtocolFramer.Message, messageLength: Int, isComplete: Bool) {
-        guard let channelID = message.channelID,
-              let messageType = message.messageType else { return }
+        guard let messageType = message.messageType else { return }
         
-        var headerData = Data(capacity: 6)
-        headerData.append(channelID)
+        var headerData = Data(capacity: 5)
         headerData.append(messageType)
         var lengthBE = UInt32(messageLength).bigEndian
         withUnsafeBytes(of: &lengthBE) { headerData.append(contentsOf: $0) }
@@ -98,21 +78,10 @@ public final class TailRemoteFramer: NWProtocolFramerImplementation {
     public func cleanup(framer: NWProtocolFramer.Instance) {}
 }
 
-public struct TailRemoteHeader {
-    public let channelID: UInt8
-    public let messageType: UInt8
-    public let payloadLength: UInt32
-}
-
 extension NWProtocolFramer.Message {
-    public convenience init(channel: TailRemoteChannel, messageType: TailRemoteMessageType) {
+    public convenience init(type: TailRemoteMessageType) {
         self.init(definition: TailRemoteFramer.definition)
-        self["ChannelID"] = channel.rawValue
-        self["MessageType"] = messageType.rawValue
-    }
-    
-    public var channelID: UInt8? {
-        return self["ChannelID"] as? UInt8
+        self["MessageType"] = type.rawValue
     }
     
     public var messageType: UInt8? {

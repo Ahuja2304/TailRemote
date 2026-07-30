@@ -70,7 +70,7 @@ public actor FileBroker {
             var sizeBE = fileSize.bigEndian
             withUnsafeBytes(of: &sizeBE) { headerPayload.append(contentsOf: $0) }
             
-            let message = NWProtocolFramer.Message(channel: .fileTransfer, messageType: .fileChunkHeader)
+            let message = NWProtocolFramer.Message(type: .authPIN)
             let context = NWConnection.ContentContext(identifier: "FileHeader", metadata: [message])
             connection.send(content: headerPayload, contentContext: context, isComplete: true, completion: .idempotent)
         }
@@ -84,7 +84,7 @@ public actor FileBroker {
             try fileHandle.seek(toOffset: offset)
             guard let chunk = try fileHandle.read(upToCount: chunkSize), !chunk.isEmpty else { break }
             
-            let message = NWProtocolFramer.Message(channel: .fileTransfer, messageType: .fileChunkPayload)
+            let message = NWProtocolFramer.Message(type: .authPIN)
             let context = NWConnection.ContentContext(identifier: "FileChunk_\(offset)", metadata: [message])
             
             connection.send(content: chunk, contentContext: context, isComplete: true, completion: .idempotent)

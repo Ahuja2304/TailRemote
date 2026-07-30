@@ -52,7 +52,126 @@ public final class SampleBufferVideoLayerView: UIView {
         videoLayer?.frame = bounds
     }
 }
-#endif
+
+// MARK: - Gatekeeper Keypad Overlay Component
+
+public struct GatekeeperPinKeypadOverlayView: View {
+    @State private var enteredPIN: String = ""
+    public var authFailed: Bool = false
+    public var onAuthenticate: ((String) -> Void)?
+    
+    public init(authFailed: Bool = false, onAuthenticate: ((String) -> Void)? = nil) {
+        self.authFailed = authFailed
+        self.onAuthenticate = onAuthenticate
+    }
+    
+    public var body: some View {
+        ZStack {
+            Color.black.opacity(0.85)
+                .ignoresSafeArea()
+            
+            VStack(spacing: 20) {
+                // Header Icon & Title
+                VStack(spacing: 6) {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 40))
+                        .foregroundColor(.blue)
+                    
+                    Text("Gatekeeper Protection")
+                        .font(.title2)
+                        .fontWeight(.bold)
+                        .foregroundColor(.white)
+                    
+                    Text("Enter 4-digit PIN displayed on MacHost")
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                }
+                
+                // PIN Code Boxes
+                HStack(spacing: 16) {
+                    ForEach(0..<4, id: \.self) { index in
+                        ZStack {
+                            RoundedRectangle(cornerRadius: 12)
+                                .fill(Color.white.opacity(0.15))
+                                .frame(width: 50, height: 60)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 12)
+                                        .stroke(index < enteredPIN.count ? Color.blue : Color.white.opacity(0.2), lineWidth: 2)
+                                )
+                            
+                            if index < enteredPIN.count {
+                                let charIndex = enteredPIN.index(enteredPIN.startIndex, offsetBy: index)
+                                Text(String(enteredPIN[charIndex]))
+                                    .font(.system(size: 28, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.white)
+                            }
+                        }
+                    }
+                }
+                
+                if authFailed {
+                    Text("⚠️ Invalid PIN. Try again (3 strikes = Block).")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.red)
+                }
+                
+                // Numeric Keypad Grid
+                let buttons: [[String]] = [
+                    ["1", "2", "3"],
+                    ["4", "5", "6"],
+                    ["7", "8", "9"],
+                    ["", "0", "⌫"]
+                ]
+                
+                VStack(spacing: 12) {
+                    ForEach(buttons, id: \.self) { row in
+                        HStack(spacing: 20) {
+                            ForEach(row, id: \.self) { item in
+                                Button(action: {
+                                    handleKeyPress(item)
+                                }) {
+                                    ZStack {
+                                        Circle()
+                                            .fill(item.isEmpty ? Color.clear : Color.white.opacity(0.2))
+                                            .frame(width: 55, height: 55)
+                                        
+                                        Text(item)
+                                            .font(.system(size: 22, weight: .bold))
+                                            .foregroundColor(.white)
+                                    }
+                                }
+                                .disabled(item.isEmpty)
+                            }
+                        }
+                    }
+                }
+            }
+            .padding(24)
+            .background(.ultraThinMaterial)
+            .cornerRadius(24)
+            .shadow(radius: 20)
+            .frame(maxWidth: 380)
+        }
+    }
+    
+    private func handleKeyPress(_ key: String) {
+        if key == "⌫" {
+            if !enteredPIN.isEmpty {
+                enteredPIN.removeLast()
+            }
+        } else if !key.isEmpty && enteredPIN.count < 4 {
+            enteredPIN.append(key)
+            if enteredPIN.count == 4 {
+                let finalPIN = enteredPIN
+                onAuthenticate?(finalPIN)
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) {
+                    enteredPIN = ""
+                }
+            }
+        }
+    }
+}
 
 // MARK: - Observable Workspace State
 
@@ -69,6 +188,8 @@ public final class ImmersiveWorkspaceState {
     public var isFilePanelPresented: Bool = false
     public var isControlPanelVisible: Bool = false
     public var isConnected: Bool = true
+    public var isAuthenticated: Bool = false
+    public var authFailed: Bool = false
     public var currentLatencyMs: Double = 14.2
     
     private var autoHideTask: Task<Void, Never>?
@@ -101,11 +222,13 @@ public final class ImmersiveWorkspaceState {
 
 // MARK: - High-Contrast Immersive iOS Workspace View
 
-#if os(iOS)
 public struct iPhoneClientWorkspaceView: View {
     @State private var state = ImmersiveWorkspaceState()
     
     public let displayLayer: AVSampleBufferDisplayLayer
+    public var isAuthenticated: Bool = false
+    public var authFailed: Bool = false
+    public var onAuthenticate: ((String) -> Void)?
     public var onRelativeMove: ((Float, Float) -> Void)?
     public var onAbsoluteMove: ((Float, Float) -> Void)?
     public var onMouseButton: ((MouseButtonType, MouseButtonState) -> Void)?
@@ -116,6 +239,9 @@ public struct iPhoneClientWorkspaceView: View {
     
     public init(
         displayLayer: AVSampleBufferDisplayLayer,
+        isAuthenticated: Bool = false,
+        authFailed: Bool = false,
+        onAuthenticate: ((String) -> Void)? = nil,
         onRelativeMove: ((Float, Float) -> Void)? = nil,
         onAbsoluteMove: ((Float, Float) -> Void)? = nil,
         onMouseButton: ((MouseButtonType, MouseButtonState) -> Void)? = nil,
@@ -125,6 +251,9 @@ public struct iPhoneClientWorkspaceView: View {
         onRequestIDR: (() -> Void)? = nil
     ) {
         self.displayLayer = displayLayer
+        self.isAuthenticated = isAuthenticated
+        self.authFailed = authFailed
+        self.onAuthenticate = onAuthenticate
         self.onRelativeMove = onRelativeMove
         self.onAbsoluteMove = onAbsoluteMove
         self.onMouseButton = onMouseButton
@@ -162,7 +291,7 @@ public struct iPhoneClientWorkspaceView: View {
             
             // Top Floating Glassmorphic High-Contrast Toolbar Overlay
             VStack {
-                if state.isToolbarVisible {
+                if state.isToolbarVisible && isAuthenticated {
                     HStack(spacing: 16) {
                         // Latency & Connection Status Badge
                         HStack(spacing: 6) {
@@ -204,106 +333,41 @@ public struct iPhoneClientWorkspaceView: View {
                                     .clipShape(Circle())
                             }
                         }
-                        .foregroundColor(.white)
                         .padding(4)
                         .background(.regularMaterial, in: Capsule())
-                        .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
                         
-                        // File Transfer Panel Button
+                        // Control Panel Toggle
                         Button(action: {
-                            state.isFilePanelPresented.toggle()
-                            if state.isFilePanelPresented {
-                                onRequestDirectoryList?()
-                            }
-                            state.userInteracted()
-                        }) {
-                            Image(systemName: "folder")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(.white)
-                                .padding(10)
-                                .background(state.isFilePanelPresented ? Color.white.opacity(0.3) : Color.clear)
-                                .background(.regularMaterial, in: Circle())
-                                .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
-                        }
-                        
-                        // Request IDR Keyframe Button (SFSymbol: arrow.clockwise.circle)
-                        Button(action: {
-                            onRequestIDR?()
-                            state.userInteracted()
-                        }) {
-                            Image(systemName: "arrow.clockwise.circle")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(.white)
-                                .padding(10)
-                                .background(.regularMaterial, in: Circle())
-                                .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
-                        }
-                        
-                        // Toggle Keyboard Button
-                        Button(action: {
-                            state.isKeyboardPresented.toggle()
-                            state.userInteracted()
-                        }) {
-                            Image(systemName: "keyboard")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(.white)
-                                .padding(10)
-                                .background(state.isKeyboardPresented ? Color.white.opacity(0.3) : Color.clear)
-                                .background(.regularMaterial, in: Circle())
-                                .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
-                        }
-                        
-                        // Toggle Control Panel Button (Sidebar Right)
-                        Button(action: {
-                            withAnimation(.spring(response: 0.3, dampingFraction: 0.7)) {
+                            withAnimation(.spring(response: 0.35, dampingFraction: 0.75)) {
                                 state.isControlPanelVisible.toggle()
                             }
                             state.userInteracted()
                         }) {
                             Image(systemName: "sidebar.right")
-                                .font(.system(size: 15, weight: .semibold))
-                                .foregroundColor(.white)
+                                .font(.system(size: 16, weight: .semibold))
                                 .padding(10)
-                                .background(state.isControlPanelVisible ? Color.white.opacity(0.35) : Color.clear)
                                 .background(.regularMaterial, in: Circle())
-                                .shadow(color: .black.opacity(0.3), radius: 4, x: 0, y: 2)
                         }
                     }
-                    .padding(.horizontal, 20)
-                    .padding(.top, 8)
-                    .environment(\.colorScheme, .dark)
+                    .padding(.horizontal, 16)
+                    .padding(.top, 12)
                     .transition(.move(edge: .top).combined(with: .opacity))
                 }
                 
                 Spacer()
             }
+            .allowsHitTesting(state.isToolbarVisible)
             
-            // Right-Side Compact Landscape Control Panel Overlay (Pinned to .trailing)
-            HStack {
-                Spacer()
-                if state.isControlPanelVisible {
-                    ClientControlPanelView(
-                        onSpaceLeft: {
-                            // Left Arrow Space Switch Action
-                        },
-                        onMissionControl: {
-                            // Mission Control Action
-                        },
-                        onSpaceRight: {
-                            // Right Arrow Space Switch Action
-                        },
-                        onToggleBandwidth: {
-                            // Bandwidth Toggle Action
-                        },
-                        onUserInteraction: {
-                            state.userInteracted()
-                        }
-                    )
-                    .padding(.trailing, 10)
-                    .transition(.move(edge: .trailing).combined(with: .opacity))
-                }
+            // Phase 3: Gatekeeper PIN Handshake Keypad Overlay (Shown when connected but not authenticated)
+            if !isAuthenticated {
+                GatekeeperPinKeypadOverlayView(
+                    authFailed: authFailed,
+                    onAuthenticate: { pin in
+                        onAuthenticate?(pin)
+                    }
+                )
+                .transition(.opacity)
             }
-            .allowsHitTesting(state.isControlPanelVisible)
         }
     }
 }
