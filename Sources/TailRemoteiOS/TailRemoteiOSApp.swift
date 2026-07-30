@@ -1,4 +1,5 @@
 import SwiftUI
+import TailRemote
 
 #if os(iOS)
 @main
@@ -18,6 +19,9 @@ struct TailRemoteAppView: View {
         if connection.isConnected {
             iPhoneClientWorkspaceView(
                 displayLayer: connection.displayLayer,
+                isAuthenticated: connection.isAuthenticated,
+                authFailed: connection.authFailed,
+                onAuthenticate: { pin in connection.authenticate(pin: pin) },
                 onRelativeMove: { dx, dy in connection.sendRelativeMove(dx: dx, dy: dy) },
                 onAbsoluteMove: { x, y in connection.sendAbsoluteMove(normalizedX: x, normalizedY: y) },
                 onMouseButton: { btn, state in connection.sendMouseButton(button: btn, state: state) },

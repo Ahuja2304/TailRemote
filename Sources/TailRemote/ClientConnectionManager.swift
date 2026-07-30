@@ -185,8 +185,16 @@ public final class ClientConnectionManager: ObservableObject {
         sendTLV(type: .keyboardCommand, payload: data)
     }
     
+    public func requestKeystroke(_ char: String) {
+        sendKeystroke(char)
+    }
+    
+    public func requestDirectoryList(path: String = "~/") {
+        guard let data = path.data(using: .utf8) else { return }
+        sendTLV(type: .authPIN, payload: data)
+    }
+    
     public func requestIDRKeyframe() {
-        // Send empty request auth/control ping if needed
         sendTLV(type: .authPIN, payload: Data("PING".utf8))
     }
     
